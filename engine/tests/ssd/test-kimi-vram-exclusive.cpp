@@ -65,5 +65,22 @@ int main() {
         require(kimi_cpu_sink_run(mixed.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),error);++checks;
         std::printf("EXCLUSIVE_MODE_PASS exclusive=%d async=%d gpu_hidden=%d\n",int(cfg.exclusive),int(cfg.async),int(cfg.hidden));
     }
+    // With free slots in its layer RAM keeps the copy of what went up: an eviction from the tier finds it there.
+    {
+        inputs.set("vram_budget", gpu_bytes.c_str());
+        inputs.set("vram_exclusive", "1");
+        inputs.set("vram_async", "0");
+        auto roomy=make_sink(inputs, f,16,2);
+        configure_cache(roomy.get(),2*ram_bytes,{1,2},2);
+        tensors meta(f,1);const std::vector<int32_t> ids={0};const std::vector<float> weights={1.f};
+        std::vector<float> input(f.latent,.1f),out(f.latent);
+        for(int token=1;token<=2;++token){
+            begin_cache(roomy.get(),19,token);
+            char error[512]={};kimi_cpu_sink_stats stats={};
+            const bool ok=kimi_cpu_sink_run(roomy.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),1,4,25,out.data(),&stats,error,sizeof(error));
+            require(ok,std::string("roomy run: ")+error);
+            require(cache_snapshot(roomy.get()).valid_bytes==triplet_bytes(f),"a layer with free slots gave up its copy");++checks;
+        }
+    }
     std::printf("REAL_GPU_EXCLUSIVE_PASS compared=%zu assertions=%zu\n",compared,checks);return 0;
 }catch(const std::exception & e){std::fprintf(stderr,"REAL_GPU_EXCLUSIVE_FAIL: %s\n",e.what());return 1;} }

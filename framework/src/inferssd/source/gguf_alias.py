@@ -3,7 +3,7 @@
 The legacy metadata reader intentionally retains historical observation semantics.
 This separate reader checks the complete header and every tensor extent without
 mapping or reading tensor payloads. Only little-endian GGUF versions 2 and 3 are
-supported. Runtime type 42 is reserved and is never admitted by this path.
+supported.
 """
 
 from __future__ import annotations
@@ -71,6 +71,7 @@ NATIVE_TYPES = {
     39: ("MXFP4", 32, 17),
     40: ("NVFP4", 64, 36),
     41: ("Q1_0", 128, 18),
+    42: ("Q2_0", 64, 18),
 }
 EXPERT_RE = re.compile(r"^blk\.(?P<layer>\d+)\.ffn_(?P<kind>up|gate|down)_exps\.weight$")
 SHARD_RE = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf$")

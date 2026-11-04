@@ -4,7 +4,7 @@
 #include "ggml-ssd/host/arbiter.h"
 #include "staging.h"
 #include "ggml-ssd/io/submit-window.h"
-#include <cuda_runtime_api.h>
+#include "gpu-runtime.h"
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>

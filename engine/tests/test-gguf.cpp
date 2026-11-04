@@ -38,7 +38,6 @@ enum handcrafted_file_type {
     HANDCRAFTED_TENSORS_NE_TOO_BIG         =  40 + offset_has_tensors,
     HANDCRAFTED_TENSORS_NBYTES_TOO_BIG     =  45 + offset_has_tensors,
     HANDCRAFTED_TENSORS_BAD_TYPE           =  50 + offset_has_tensors,
-    HANDCRAFTED_TENSORS_REMOVED_TYPE       =  51 + offset_has_tensors,
     HANDCRAFTED_TENSORS_RESERVED_TYPE      =  52 + offset_has_tensors,
     HANDCRAFTED_TENSORS_BAD_OFFSET         =  60 + offset_has_tensors,
     HANDCRAFTED_TENSORS_DUPLICATE_NAME     =  70 + offset_has_tensors,
@@ -77,7 +76,6 @@ static std::string handcrafted_file_type_name(const enum handcrafted_file_type h
         case HANDCRAFTED_TENSORS_NE_TOO_BIG:         return "TENSORS_NE_TOO_BIG";
         case HANDCRAFTED_TENSORS_NBYTES_TOO_BIG:     return "TENSORS_NBYTES_TOO_BIG";
         case HANDCRAFTED_TENSORS_BAD_TYPE:           return "TENSORS_BAD_TYPE";
-        case HANDCRAFTED_TENSORS_REMOVED_TYPE:       return "TENSORS_REMOVED_TYPE";
         case HANDCRAFTED_TENSORS_RESERVED_TYPE:      return "TENSORS_RESERVED_TYPE";
         case HANDCRAFTED_TENSORS_BAD_OFFSET:         return "TENSORS_BAD_OFFSET";
         case HANDCRAFTED_TENSORS_DUPLICATE_NAME:     return "TENSORS_DUPLICATE_NAME";
@@ -396,7 +394,6 @@ static FILE * get_handcrafted_file(const unsigned int seed, const enum handcraft
 
         {
             const int32_t type32 = hft == HANDCRAFTED_TENSORS_BAD_TYPE ? GGML_TYPE_COUNT :
-                hft == HANDCRAFTED_TENSORS_REMOVED_TYPE ? 42 :
                 hft == HANDCRAFTED_TENSORS_RESERVED_TYPE ? 4 : int32_t(type);
             helper_write(file, type32);
         }
@@ -713,7 +710,6 @@ static std::pair<int, int> test_handcrafted_file(const unsigned int seed) {
         HANDCRAFTED_TENSORS_NE_TOO_BIG,
         HANDCRAFTED_TENSORS_NBYTES_TOO_BIG,
         HANDCRAFTED_TENSORS_BAD_TYPE,
-        HANDCRAFTED_TENSORS_REMOVED_TYPE,
         HANDCRAFTED_TENSORS_RESERVED_TYPE,
         HANDCRAFTED_TENSORS_BAD_OFFSET,
         HANDCRAFTED_TENSORS_DUPLICATE_NAME,

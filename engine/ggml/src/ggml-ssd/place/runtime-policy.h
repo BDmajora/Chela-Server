@@ -350,6 +350,32 @@ inline prefill_selection plan_prefill(const prefill_input & in, const prefill_ca
     return out;
 }
 
+// Decode's approximate routing (decode.drop_mass): the selected experts that no expert cache holds go, lowest routing
+// weight first, while their weight stays within `budget` of the layer's and at least half of the picks stay (MoE-Infinity's
+// mass drop on a miss, moe-cache's skip of low-ranked picks not in memory). drop[i] marks them; the result scales the kept
+// weights back to the layer's total, 1 when nothing goes. It trades fidelity for time, so it is the caller's opt-in.
+inline double plan_expert_drop(const int32_t * ids, const float * weights, const uint8_t * resident, int n, double budget,
+        std::vector<uint8_t> & drop) {
+    drop.assign(size_t(n), 0);
+    double total = 0.0;
+    int live = 0;
+    std::vector<int> order;
+    for (int i = 0; i < n; ++i) {
+        if (ids[i] < 0) { continue; }
+        total += weights[i]; ++live;
+        if (!resident[i]) { order.push_back(i); }
+    }
+    if (!(budget > 0.0) || !(total > 0.0) || order.empty()) { return 1.0; }
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return weights[a] < weights[b]; });
+    double dropped = 0.0;
+    int kept = live;
+    for (int i : order) {
+        if (kept - 1 < (live + 1) / 2 || dropped + weights[i] > budget * total) { break; }
+        drop[size_t(i)] = 1; dropped += weights[i]; --kept;
+    }
+    return total / (total - dropped);
+}
+
 inline double miss_cost(size_t ram, size_t ssd, double cpu_expert_us, double io_us,
         bool in_place, double host_expert_us) {
     double compute = cpu_expert_us;

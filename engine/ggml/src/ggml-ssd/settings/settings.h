@@ -62,6 +62,7 @@ class snapshot {
     const setting *                   find(const std::string & key) const noexcept;
     const uint64_t *                  integer(const std::string & key) const noexcept;
     const std::vector<std::string> *  sources() const noexcept;
+    const std::vector<std::string> *  paths(const std::string & key) const noexcept;
     const std::vector<uint32_t> *     cpus(const std::string & key) const noexcept;
     const cost_table *                costs() const noexcept;
     const budget *                    vram_budget() const noexcept;

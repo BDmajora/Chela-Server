@@ -534,6 +534,49 @@ static std::vector<kimi_place_item> layer_items(uint64_t & state, size_t n, int 
 
 // One token: the vector engine, the one-token CPU time, page-locked copies only. The grouped path's lines and the
 // pageable rate do not change the answer; a pass of one token and a decode token of the same layer are the same call.
+// ES-MoE's expert-level order of the GPU lane's moves: Johnson's rule where it ends the pipeline sooner, the given order
+// otherwise; equal copies keep the order by computation they arrive in.
+static void test_johnson() {
+    // equal copies, computations descending (the order moves are chosen in): unchanged
+    {
+        const double d[3] = { 100, 100, 100 }, c[3] = { 400, 250, 120 };
+        std::vector<size_t> order = { 0, 1, 2 };
+        kimi_place_johnson(order, d, c);
+        check(order == std::vector<size_t>({ 0, 1, 2 }), "johnson: equal copies keep the order by computation");
+    }
+    // a link-bound expert ahead of a resident-like one: the in-place move (no copy) runs first, the copy-heavy one last
+    {
+        const double d[3] = { 500, 0, 300 }, c[3] = { 100, 400, 600 };
+        std::vector<size_t> order = { 0, 1, 2 };
+        std::vector<double> cs, ds;
+        for (size_t i : order) { cs.push_back(c[i]); ds.push_back(d[i]); }
+        const double before = kimi_place_pipeline(cs.data(), ds.data(), 3);
+        kimi_place_johnson(order, d, c);
+        check(order == std::vector<size_t>({ 1, 2, 0 }), "johnson: copy no longer than compute first, by copy; then by compute");
+        cs.clear(); ds.clear();
+        for (size_t i : order) { cs.push_back(c[i]); ds.push_back(d[i]); }
+        check(kimi_place_pipeline(cs.data(), ds.data(), 3) < before, "johnson: the pipeline ends sooner");
+    }
+    // random layers: never later than the given order over two slots
+    uint64_t state = 7;
+    auto unit = [&] { state = state * 6364136223846793005ull + 1442695040888963407ull; return double(state >> 11) / double(1ull << 53); };
+    for (int layer = 0; layer < 200; ++layer) {
+        const size_t n = 2 + size_t(unit() * 14);
+        std::vector<double> d(n), c(n);
+        for (size_t i = 0; i < n; ++i) { d[i] = unit() < 0.3 ? 0.0 : 50 + 900 * unit(); c[i] = 50 + 900 * unit(); }
+        std::vector<size_t> order(n);
+        for (size_t i = 0; i < n; ++i) { order[i] = i; }
+        auto end = [&](const std::vector<size_t> & o) {
+            std::vector<double> cs, ds;
+            for (size_t i : o) { cs.push_back(c[i]); ds.push_back(d[i]); }
+            return kimi_place_pipeline(cs.data(), ds.data(), o.size());
+        };
+        const double before = end(order);
+        kimi_place_johnson(order, d.data(), c.data());
+        check(end(order) <= before, "johnson: a reorder ended the pipeline later");
+    }
+}
+
 static void test_place_one_token() {
     uint64_t state = 31337;
     size_t same = 0, no_pageable = 0, total = 0, moved = 0;
@@ -901,6 +944,7 @@ int main() {
     test_ring_same();
     test_ring_prefix_fold();
     test_pipeline();
+    test_johnson();
     test_place_one_token();
     test_place_decode_same();
     test_place_m8_same();

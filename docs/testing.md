@@ -16,6 +16,22 @@ interchangeable with the portable unit gate. Do not interpret a full-suite run o
 a production device acceptance test. GPU and cgroup suites need dedicated launchers
 and explicit resource prerequisites before they can become automated gates.
 
+The GPU tier's tests build for whichever backend the tree selects: CUDA, or HIP with
+`-DGGML_HIP=ON` (the `linux-rocm` preset). They run on an owned device and are not in
+CTest. Those that go through the RAM cache need a finite cgroup, or the lookahead
+and warm-pool runs have no RAM to read from and check less:
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 \
+  env TMPDIR="$PWD/tmp" ./bin/test-kimi-vram-generic
+```
+
+`test-kimi-vram-warm` checks the warm pool's conversion against ggml's CPU quantizers,
+and `test-kimi-vram-generic` the prior, the lookahead and the warm pool through the
+sink, and layers of mixed formats at a hidden width of 640, as `test-kimi-vram-group`
+does on the batched engine. The model-free `test-kimi-vram-prior-replay` and `test-ssd-expert-trace` are in
+the `main` label.
+
 Some bundled upstream tests in a full run depend on outside resources: `test-download-model`
 fetches the model that `test-thread-safety` and `test-state-restore-fragmented` use,
 `test-tokenizers-ggml-vocabs` clones vocabularies with Git LFS, `test-quant-type-selection`

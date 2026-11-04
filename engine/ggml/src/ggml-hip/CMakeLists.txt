@@ -87,6 +87,17 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_SOURCES_ROCM}
                         )
 
+# A build directory configured before its HIP compiler worked (for example, before the device
+# libraries were installed) can cache empty per-configuration HIP flags. Every kernel is then built
+# at -O0 and runs about 100 times slower, so restore the optimization level of the build type.
+if (NOT CXX_IS_HIPCC AND CMAKE_BUILD_TYPE AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" GGML_HIP_CONFIG)
+    if (NOT " ${CMAKE_HIP_FLAGS} ${CMAKE_HIP_FLAGS_${GGML_HIP_CONFIG}} " MATCHES " -O[0-9sz]? ")
+        message(WARNING "CMAKE_HIP_FLAGS_${GGML_HIP_CONFIG} has no optimization level; building the HIP kernels with -O3")
+        target_compile_options(ggml-hip PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-O3>)
+    endif()
+endif()
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
@@ -155,3 +166,19 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+# The CPU sink's expert VRAM tier, from the CUDA sources (last, so that it inherits this directory's definitions).
+if (GGML_CUDA_KIMI_VRAM_TIER)
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "SSD GPU executor requires Linux")
+    endif()
+    if (CXX_IS_HIPCC)
+        message(FATAL_ERROR "The SSD GPU executor needs the HIP language (CMAKE_HIP_COMPILER), not hipcc as the C++ compiler")
+    endif()
+    set(GGML_HIP_SSD_SOURCES ../ggml-cuda/ssd/staging.cpp ../ggml-cuda/ssd/group-matmul.cu
+        ../ggml-cuda/ssd/expert-requantize.cu)
+    set_source_files_properties(${GGML_HIP_SSD_SOURCES} PROPERTIES LANGUAGE HIP)
+    target_sources(ggml-hip PRIVATE ${GGML_HIP_SSD_SOURCES})
+    target_link_libraries(ggml-hip PRIVATE ggml-ssd-object-io)
+    add_subdirectory(../ggml-cuda/ssd ggml-cuda-ssd)
+endif()

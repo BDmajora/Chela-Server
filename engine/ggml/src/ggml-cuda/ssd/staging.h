@@ -3,10 +3,14 @@
 #include "ggml-ssd/store/object-identity.h"
 #include "ggml-ssd/io/object-uring.h"
 #include <vector>
+#if defined(GGML_USE_HIP)
+#include "gpu-runtime.h" // cudaEvent_t and cudaStream_t name HIP's handles
+#else
 struct CUevent_st;
 using cudaEvent_t = CUevent_st *;
 struct CUstream_st;
 using cudaStream_t = CUstream_st *;
+#endif
 namespace ggml_moe_common {
 using namespace ssd::io;
 struct object_stage_slot {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-cpu/ssd/cpu-sink.h"
+#include "ggml-ssd/gpu/kimi-vram-tier-api.h"
 #include "cpu-prefill.h"
 #include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/telemetry/telemetry.h"
@@ -82,6 +83,7 @@ struct llama_kimi_cpu_sink_runtime {
     // Expert tensor shapes of every layer, so that the sink's next-layer prefetch can resolve the next layer's
     // experts while the current layer's node is active: name -> (bytes per expert, experts).
     std::map<std::string, std::pair<size_t, int64_t>> expert_shapes;
+    std::vector<kimi_vram_layer_format> expert_formats; // the routed layers', for the GPU tier
     decltype(&kimi_cpu_sink_prefetch_hint) prefetch_hint = nullptr; // optional
     bool sequence_known = false;
     llama_seq_id sequence = 0;
@@ -209,6 +211,9 @@ struct llama_kimi_cpu_sink_runtime {
         if (!cache_configure(sink, cache_budget, layer_priority.data(),
                 static_cast<int>(layer_priority.size()), cache_max_per_layer, error, sizeof(error))) {
             throw std::runtime_error(std::string("CPU sink cache configuration failed: ") + error + "; no fallback");
+        }
+        if (!cpu_api->expert_formats(sink, expert_formats.data(), int(expert_formats.size()), error, sizeof(error))) {
+            throw std::runtime_error(std::string("CPU sink expert formats: ") + error + "; no fallback");
         }
         std::fprintf(stderr,
             "[kimi_cpu_sink] enabled ring_experts=%d n_tokens=1 expert_h2d_bytes=0"

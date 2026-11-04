@@ -178,6 +178,45 @@
             "maximum": 4294967295,
             "default": 0
         },
+        "vram.lookahead": {
+            "description": "Highest-ranked experts the next layer's router predicts that go from RAM to the GPU tier ahead of their selection, as far as the link has time; zero waits for the selection",
+            "kind": "integer",
+            "unit": "predicted experts",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-vram-lookahead",
+            "default_literal": "0",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 16,
+            "default": 0
+        },
+        "vram.warm_mib": {
+            "description": "Device memory for low-precision copies of the experts the GPU tier evicts, requantized in place and served until the tier admits them again; changes results; zero keeps evicted experts on the CPU path",
+            "kind": "integer",
+            "unit": "MiB",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-vram-warm-mib",
+            "default_literal": "0",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65536,
+            "default": 0
+        },
+        "vram.warm_bits": {
+            "description": "Precision of the copies vram.warm_mib keeps: 4 for Q4_0, 2 for Q2_0",
+            "kind": "integer",
+            "unit": "bits",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-vram-warm-bits",
+            "default_literal": "4",
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 4,
+            "default": 4
+        },
         "vram.reserve_mib": {
             "description": "VRAM in MiB that prefill and decode leave free for other processes",
             "kind": "integer",
@@ -216,6 +255,60 @@
             "minimum": 0,
             "maximum": 17592186044415,
             "default": 0
+        },
+        "decode.drop_mass": {
+            "description": "Routing weight per layer that decode may drop among selected experts no expert cache holds, lowest weight first; trades fidelity for time and changes results",
+            "kind": "integer",
+            "unit": "percent of routing weight",
+            "producer": "plan",
+            "scope": "all",
+            "cli": "--ssd-decode-drop-mass",
+            "default_literal": "0",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 50,
+            "default": 0
+        },
+        "trace.capacity": {
+            "description": "Requests the expert predictor keeps traced to match later prompts; zero predicts from the prompt, the last request and the usage profile alone",
+            "kind": "integer",
+            "unit": "requests",
+            "producer": "plan",
+            "scope": "all",
+            "cli": "--ssd-trace-capacity",
+            "default_literal": "32",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1024,
+            "default": 32
+        },
+        "trace.prior": {
+            "description": "Start each request's decode in the GPU expert tier from its predicted expert selections",
+            "kind": "integer",
+            "unit": "boolean",
+            "producer": "plan",
+            "scope": "all",
+            "cli": "--ssd-trace-prior",
+            "default_literal": "1",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 1
+        },
+        "trace.file": {
+            "description": "At most one file that keeps the expert traces and usage profile across runs; empty keeps them for the process",
+            "kind": "paths",
+            "unit": "path",
+            "producer": "plan",
+            "scope": "all",
+            "cli": "--ssd-trace-file",
+            "default_literal": "[]",
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1
+            },
+            "default": []
         },
         "model.engram_prefetch": {
             "description": "Read ahead DeepSeek Engram rows; changes I/O timing only",

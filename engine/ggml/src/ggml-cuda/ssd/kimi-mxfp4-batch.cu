@@ -1,7 +1,11 @@
 #include "kimi-mxfp4-batch.h"
+#if defined(GGML_USE_HIP)
+#define GGML_COMMON_DECL_HIP
+#else
 #define GGML_COMMON_DECL_CUDA
+#endif
 #include "ggml-common.h"
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -16,6 +20,22 @@ __device__ inline int fp4_value(int nibble) {
     const int m = nibble & 7;
     const int magnitude = m < 4 ? m : (2 + (m & 1)) << ((m >> 1) - 1);
     return (nibble & 8) ? -magnitude : magnitude;
+}
+
+// The signed 8-bit four-way dot product: CUDA's __dp4a, on AMD the same exact integer sum (as ggml_cuda_dp4a).
+__device__ inline int batch_dp4a(int a, int b, int c) {
+#if defined(GGML_USE_HIP)
+#if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#elif defined(RDNA3) || defined(RDNA4)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    const int8x4_t va = reinterpret_cast<const int8x4_t &>(a), vb = reinterpret_cast<const int8x4_t &>(b);
+    return c + va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
+#endif
+#else
+    return __dp4a(a, b, c);
+#endif
 }
 
 __device__ inline float fp4_scale(uint8_t exponent) {
@@ -62,7 +82,7 @@ __global__ void batch_rows_warp(const char * up, const char * gate, const char *
                     (uint32_t(uint8_t(y.qs[index + 1])) << 8) |
                     (uint32_t(uint8_t(y.qs[index + 2])) << 16) |
                     (uint32_t(uint8_t(y.qs[index + 3])) << 24);
-                dot = __dp4a(packed[j], int(q), dot);
+                dot = batch_dp4a(packed[j], int(q), dot);
             }
             sums[t] += (__half2float(y.d) * scale) * float(dot);
         }
@@ -72,7 +92,7 @@ __global__ void batch_rows_warp(const char * up, const char * gate, const char *
         float sum = sums[t];
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(0xffffffff, sum, offset);
+            sum += __shfl_down_sync(0xffffffff, sum, offset, 32);
         }
         if (lane == 0 && first + t < tokens) {
             const size_t index = first_stage ? size_t(2 * (first + t) + role) * rows + row

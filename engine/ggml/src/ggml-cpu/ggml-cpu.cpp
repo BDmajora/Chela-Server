@@ -712,6 +712,7 @@ static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
         &kimi_cpu_sink_call_close,
         &kimi_cpu_sink_call_join,
         &kimi_cpu_sink_cache_configure,
+        &kimi_cpu_sink_expert_formats,
         &kimi_cpu_sink_cache_begin,
         &kimi_cpu_sink_vram_phase_complete,
         &kimi_cpu_sink_cache_get_stats,

@@ -71,4 +71,4 @@ def test_strict_type_table_matches_compiled_native_traits(tmp_path):
             excluded.add(int(number))
     assert native == NATIVE_TYPES
     assert excluded.isdisjoint(NATIVE_TYPES)
-    assert 42 not in NATIVE_TYPES
+    assert NATIVE_TYPES[42] == ("Q2_0", 64, 18)

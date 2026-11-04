@@ -128,6 +128,13 @@ using key = std::pair<std::string, int32_t>;
 struct fixture {
     int latent = 256, hidden = 256, experts = 20, fd = -1;
     ggml_type type = GGML_TYPE_Q3_K, down_type = GGML_TYPE_Q3_K; // up/gate and down payload types
+    // Layer 2's own types, where it has its own: a quantizer picks them per layer.
+    ggml_type layer2_type = GGML_TYPE_COUNT, layer2_down_type = GGML_TYPE_COUNT;
+    ggml_type role_type(int layer, int role) const {
+        const ggml_type up = layer == 2 && layer2_type != GGML_TYPE_COUNT ? layer2_type : type;
+        const ggml_type down = layer == 2 && layer2_down_type != GGML_TYPE_COUNT ? layer2_down_type : down_type;
+        return role == 2 ? down : up;
+    }
     std::string path;
     bool remove_on_destroy = false;
     std::map<key, entry> entries;
@@ -181,7 +188,7 @@ static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
         for (int role = 0; role < 3; ++role) {
             const int cols = role == 2 ? f.hidden : f.latent;
             const int rows = role == 2 ? f.latent : f.hidden;
-            const ggml_type type = role == 2 ? f.down_type : f.type;
+            const ggml_type type = f.role_type(layer, role);
             const size_t bytes = ggml_row_size(type, cols) * rows;
             const std::vector<float> importance(
                 ggml_quantize_requires_imatrix(type) ? size_t(cols) : 0, 1.0f);
@@ -227,7 +234,7 @@ struct tensors {
     tensors(const fixture & f, int layer) {
         ctx = ggml_init({ ggml_tensor_overhead() * 4, nullptr, true }); require(ctx, "metadata context failed");
         for (int r = 0; r < 3; ++r) {
-            role[r] = ggml_new_tensor_3d(ctx, r == 2 ? f.down_type : f.type, r == 2 ? f.hidden : f.latent,
+            role[r] = ggml_new_tensor_3d(ctx, f.role_type(layer, r), r == 2 ? f.hidden : f.latent,
                                        r == 2 ? f.latent : f.hidden, f.experts);
             ggml_set_name(role[r], tensor_name(layer, r).c_str());
             require(role[r]->data == nullptr, "sink metadata unexpectedly has payload");
@@ -2461,6 +2468,44 @@ static void q2_activation_test(fixture_inputs & inputs, int threads, int depth) 
     std::printf("DSV41_Q2_CPU_SINK_DECODE_OK threads=%d ring_experts=%d\n", threads, depth);
 }
 
+// decode.drop_mass: with nothing cached every expert may go, lowest weight first, within the budget and with at least
+// half of the picks kept. The run equals, bit for bit, the router's slots without those experts and the kept weights
+// scaled back to the total, as a caller would pass them.
+static void drop_test(fixture_inputs & inputs, int threads, int depth) {
+    const kimi_cpu_sink_activation clamp = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f };
+    fixture f;
+    f.type = GGML_TYPE_Q8_0;
+    f.down_type = GGML_TYPE_Q8_0;
+    f.latent = 512;
+    f.hidden = 256;
+    make_synthetic(f, 20261103);
+    std::mt19937 rng(4102);
+    std::normal_distribution<float> sample(0.0f, 1.5f);
+    std::vector<float> input(static_cast<size_t>(f.latent));
+    for (auto & value : input) { value = sample(rng); }
+    const std::vector<int32_t> ids = { 5, 1, 7, 2, 6, 3 };
+    const std::vector<float> weights = { .4f, .25f, .15f, .1f, .06f, .04f };
+    auto reference = make_sink(inputs, f, threads, depth);
+    inputs.set("drop_mass", "20");
+    auto dropping = make_sink(inputs, f, threads, depth);
+    inputs.set("drop_mass", "0");
+    // 0.20 of the mass: .04, .06 and .1 go (exactly the budget), which leaves the three picks of six that must stay
+    const std::vector<int32_t> kept_ids = { 5, 1, 7, -1, -1, -1 };
+    const double total = 1.0, scale = total / (total - (.04 + .06 + double(.1f)));
+    std::vector<float> kept_weights;
+    for (float w : weights) { kept_weights.push_back(float(double(w) * scale)); }
+    tensors meta(f, 1);
+    std::vector<float> expected(input.size()), got(input.size());
+    kimi_cpu_sink_stats stats = {};
+    char error[512] = {};
+    require(kimi_cpu_sink_run_activation(reference.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), kept_ids.data(),
+        kept_weights.data(), int(kept_ids.size()), &clamp, expected.data(), &stats, error, sizeof(error)), error);
+    require(kimi_cpu_sink_run_activation(dropping.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(),
+        weights.data(), int(ids.size()), &clamp, got.data(), &stats, error, sizeof(error)), error);
+    require(std::memcmp(got.data(), expected.data(), got.size() * sizeof(float)) == 0, "a dropped run differs from the router's kept slots");
+    std::printf("CPU_SINK_DROP_OK threads=%d ring_experts=%d\n", threads, depth);
+}
+
 // The RAM cache's storage at load (kimi_cpu_sink_vram_reserve; without a unified-memory GPU, as here, the cache's
 // part runs): the geometry from the tensors' strides is the one the first decode token learns, and the slots the
 // ledger admits are committed and paged in, so decode commits no new slot. A sink without the load step is the
@@ -4124,6 +4169,7 @@ int main(int argc, char ** argv) {
         bool poll_mode = false, poll_early_mode = false, cache_compute_mode = false, cache_location_mode = false;
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
         bool activation_mode = false, q2_activation_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
+        bool drop_mode = false;
         bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, work_reclaim_mode = false, threadpool_mode = false;
         bool swiglu_mode = false;
         std::string pack, prefix;
@@ -4168,6 +4214,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--muse-bf16-test")) { muse_bf16_mode = true; }
             else if (!std::strcmp(argv[i], "--activation-tests")) { activation_mode = true; }
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
+            else if (!std::strcmp(argv[i], "--drop-test")) { drop_mode = true; }
             else if (!std::strcmp(argv[i], "--threadpool-tests")) { threadpool_mode = true; }
             else if (!std::strcmp(argv[i], "--swiglu-tests")) { swiglu_mode = true; }
             else { throw std::runtime_error("usage: test-kimi-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--fixture KEY=VALUE] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
@@ -4209,6 +4256,7 @@ int main(int argc, char ** argv) {
         }
         if (activation_mode) { activation_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (q2_activation_mode) { q2_activation_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (drop_mode) { drop_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_location_mode) { cache_location_tests(inputs, options.threads, options.ring_experts); return 0; }
         if (cache_compute_mode) { cache_compute_tests(inputs, options.threads, options.ring_experts); return 0; }
         if (hitrate_mode) { cache_hitrate_tests(inputs, options.threads, options.ring_experts); return 0; }

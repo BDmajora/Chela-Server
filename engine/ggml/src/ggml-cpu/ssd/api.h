@@ -22,6 +22,7 @@ struct api_v2 {
     decltype(&kimi_cpu_sink_call_close) call_close;
     decltype(&kimi_cpu_sink_call_join) call_join;
     decltype(&kimi_cpu_sink_cache_configure) cache_configure;
+    decltype(&kimi_cpu_sink_expert_formats) expert_formats;
     decltype(&kimi_cpu_sink_cache_begin) cache_begin;
     decltype(&kimi_cpu_sink_vram_phase_complete) vram_phase_complete;
     decltype(&kimi_cpu_sink_cache_get_stats) cache_get_stats;
@@ -52,6 +53,7 @@ inline bool valid(const api_v2 * api) noexcept {
         api->destroy &&
         api->call_open && api->call_close && api->call_join &&
         api->cache_configure &&
+        api->expert_formats &&
         api->cache_begin &&
         api->vram_phase_complete &&
         api->cache_get_stats &&

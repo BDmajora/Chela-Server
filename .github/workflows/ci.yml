@@ -38,7 +38,7 @@ jobs:
           python3 scripts/inferssd/check-layout.py
       - name: Shell and Python syntax
         run: |
-          shellcheck scripts/upstream-snapshot.sh bench/device/gate.sh
+          shellcheck build.sh scripts/upstream-snapshot.sh bench/device/gate.sh
           python3 -m py_compile scripts/public-scan.py scripts/check-pr-title.py
           python3 scripts/test-public-scan.py
           python3 scripts/test-check-pr-title.py

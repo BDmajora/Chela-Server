@@ -1,4 +1,4 @@
-"""Original header metadata parser. Type 42 is historical metadata, not native support."""
+"""Original header metadata parser."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ TYPES = {
     39: ("MXFP4", 32, 17),
     40: ("NVFP4", 64, 36),
     41: ("Q1_0", 128, 18),
-    42: ("F8_E4M3_B128", 128, 129),
+    42: ("Q2_0", 64, 18),
 }
 SCALARS = {
     0: "B",

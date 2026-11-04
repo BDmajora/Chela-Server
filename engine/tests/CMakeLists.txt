@@ -143,6 +143,19 @@ target_include_directories(test-ssd-runtime-policy PRIVATE ../ggml/src)
 add_test(NAME ssd_runtime_policy COMMAND test-ssd-runtime-policy)
 set_property(TEST ssd_runtime_policy PROPERTY LABELS main)
 
+add_executable(test-ssd-expert-trace ssd/test-ssd-expert-trace.cpp)
+target_compile_features(test-ssd-expert-trace PRIVATE cxx_std_17)
+target_include_directories(test-ssd-expert-trace PRIVATE ../ggml/src)
+add_test(NAME ssd_expert_trace COMMAND test-ssd-expert-trace)
+set_property(TEST ssd_expert_trace PROPERTY LABELS main)
+
+# The GPU tier's slot table with and without the request-level prior, over a synthetic request stream (model-free).
+add_executable(test-kimi-vram-prior-replay ssd/test-kimi-vram-prior-replay.cpp)
+target_compile_features(test-kimi-vram-prior-replay PRIVATE cxx_std_17)
+target_include_directories(test-kimi-vram-prior-replay PRIVATE ../ggml/src ../ggml/src/ggml-cuda/ssd ../ggml/include)
+add_test(NAME kimi_vram_prior_replay COMMAND test-kimi-vram-prior-replay)
+set_property(TEST kimi_vram_prior_replay PROPERTY LABELS main)
+
 add_executable(test-kimi-prefill-cost ssd/test-kimi-prefill-cost.cpp)
 target_compile_features(test-kimi-prefill-cost PRIVATE cxx_std_17)
 target_include_directories(test-kimi-prefill-cost PRIVATE ../ggml/src/ggml-cpu)
@@ -307,74 +320,108 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME ${lease_target} COMMAND ${lease_target})
     endforeach()
     if (TARGET kimi-vram-tier)
+        # The tier's backend and runtime: ggml-cuda and CUDA's, or ggml-hip and HIP's. Under HIP the GPU test sources
+        # are HIP language, for the CUDA-to-HIP names gpu-runtime.h brings in; the language links HIP's runtime.
+        if (GGML_HIP)
+            enable_language(HIP) # ggml-hip enables it for its own directory only
+            set(SSD_GPU_BACKEND ggml-hip)
+            set(SSD_GPU_RUNTIME "")
+        else()
+            set(SSD_GPU_BACKEND ggml-cuda)
+            set(SSD_GPU_RUNTIME CUDA::cudart)
+        endif()
+        function(ssd_gpu_test_language target)
+            if (GGML_HIP)
+                get_target_property(sources ${target} SOURCES)
+                set_source_files_properties(${sources} TARGET_DIRECTORY ${target} PROPERTIES LANGUAGE HIP)
+                get_target_property(architectures ggml-hip HIP_ARCHITECTURES) # the backend's device targets
+                set_target_properties(${target} PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON
+                    HIP_ARCHITECTURES "${architectures}")
+                target_compile_definitions(${target} PRIVATE GGML_USE_HIP __HIP_PLATFORM_AMD__)
+            endif()
+        endfunction()
         # GPU tests require explicit ownership of a lane and normally linked
         # backend objects; do not acquire a shared GPU automatically in ctest.
         foreach(tier_test test-kimi-vram-async test-kimi-vram-deferred test-kimi-vram-exclusive
                 test-kimi-vram-component-error test-kimi-vram-format-compat test-kimi-vram-pool-cuda
                 test-kimi-vram-elastic test-kimi-vram-reclaim)
             add_executable(${tier_test} ssd/${tier_test}.cpp)
+            ssd_gpu_test_language(${tier_test})
             target_compile_features(${tier_test} PRIVATE cxx_std_17)
             target_compile_options(${tier_test} PRIVATE -fno-fast-math -ffp-contract=off)
             target_include_directories(${tier_test} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/ssd ../vendor)
-            target_link_libraries(${tier_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+            target_link_libraries(${tier_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base ${SSD_GPU_BACKEND} ${SSD_GPU_RUNTIME} Threads::Threads ${CMAKE_DL_LIBS})
             add_dependencies(${tier_test} kimi-mxfp4-parity kimi-vram-tier)
         endforeach()
         # DeepSeek-V4.1 MXFP4 tier: component rows and the sink end to end. Like the
         # tests above they need an owned GPU and normally linked backend objects, so they stay out of ctest.
         foreach(mxfp4_test test-kimi-mxfp4-parity test-kimi-mxfp4-chain test-kimi-vram-mxfp4)
             add_executable(${mxfp4_test} ssd/${mxfp4_test}.cpp)
+            ssd_gpu_test_language(${mxfp4_test})
             target_compile_features(${mxfp4_test} PRIVATE cxx_std_17)
             target_compile_options(${mxfp4_test} PRIVATE -fno-fast-math -ffp-contract=off)
             target_include_directories(${mxfp4_test} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/ssd ../vendor)
-            target_link_libraries(${mxfp4_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+            target_link_libraries(${mxfp4_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base ${SSD_GPU_BACKEND} ${SSD_GPU_RUNTIME} Threads::Threads ${CMAKE_DL_LIBS})
             add_dependencies(${mxfp4_test} kimi-mxfp4-parity kimi-vram-tier)
         endforeach()
         add_executable(test-kimi-prefill-scratch ssd/test-kimi-prefill-scratch.cpp)
+        ssd_gpu_test_language(test-kimi-prefill-scratch)
         target_compile_features(test-kimi-prefill-scratch PRIVATE cxx_std_17)
         target_compile_definitions(test-kimi-prefill-scratch PRIVATE KIMI_SCRATCH_MXFP4_ONLY)
         target_compile_options(test-kimi-prefill-scratch PRIVATE -fno-fast-math -ffp-contract=off)
         target_include_directories(test-kimi-prefill-scratch PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../vendor)
-        target_link_libraries(test-kimi-prefill-scratch PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+        target_link_libraries(test-kimi-prefill-scratch PRIVATE ggml-ssd-host ggml-cpu ggml-base ${SSD_GPU_BACKEND} ${SSD_GPU_RUNTIME} Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-prefill-scratch kimi-mxfp4-parity kimi-vram-tier)
         add_executable(test-kimi-vram-generic ssd/test-kimi-vram-generic.cpp)
+        ssd_gpu_test_language(test-kimi-vram-generic)
         target_compile_features(test-kimi-vram-generic PRIVATE cxx_std_17)
         target_include_directories(test-kimi-vram-generic PRIVATE ../ggml/src ../ggml/src/ggml-cpu
             ../ggml/src/ggml-cuda/ssd ../vendor)
-        target_link_libraries(test-kimi-vram-generic PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda
-            CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+        target_link_libraries(test-kimi-vram-generic PRIVATE ggml-ssd-host ggml-cpu ggml-base ${SSD_GPU_BACKEND}
+            ${SSD_GPU_RUNTIME} Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-vram-generic kimi-vram-tier)
+        # The warm pool's conversion against ggml's CPU quantizers (owned GPU; not in ctest).
+        add_executable(test-kimi-vram-warm ssd/test-kimi-vram-warm.cpp)
+        ssd_gpu_test_language(test-kimi-vram-warm)
+        target_compile_features(test-kimi-vram-warm PRIVATE cxx_std_17)
+        target_include_directories(test-kimi-vram-warm PRIVATE ../ggml/src ../ggml/src/ggml-cuda/ssd)
+        target_link_libraries(test-kimi-vram-warm PRIVATE ggml-cpu ggml-base ${SSD_GPU_BACKEND} ${SSD_GPU_RUNTIME})
         # The CUDA backend's grouped-expert products against ggml's CPU MUL_MAT (owned GPU; not in ctest).
         add_executable(test-kimi-vram-mm ssd/test-kimi-vram-mm.cpp)
+        ssd_gpu_test_language(test-kimi-vram-mm)
         target_compile_features(test-kimi-vram-mm PRIVATE cxx_std_17)
-        target_link_libraries(test-kimi-vram-mm PRIVATE ggml-cpu ggml-base ggml-cuda CUDA::cudart)
+        target_include_directories(test-kimi-vram-mm PRIVATE ../ggml/src/ggml-cuda/ssd)
+        target_link_libraries(test-kimi-vram-mm PRIVATE ggml-cpu ggml-base ${SSD_GPU_BACKEND} ${SSD_GPU_RUNTIME})
         # The tier's grouped prefill engine against the CPU lane, and its timing mode (owned GPU; not in ctest).
         add_executable(test-kimi-vram-group ssd/test-kimi-vram-group.cpp)
+        ssd_gpu_test_language(test-kimi-vram-group)
         target_compile_features(test-kimi-vram-group PRIVATE cxx_std_17)
         target_include_directories(test-kimi-vram-group PRIVATE ../ggml/src ../ggml/src/ggml-cpu
             ../ggml/src/ggml-cuda/ssd ../vendor)
-        target_link_libraries(test-kimi-vram-group PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+        target_link_libraries(test-kimi-vram-group PRIVATE ggml-ssd-host ggml-cpu ggml-base ${SSD_GPU_BACKEND} ${SSD_GPU_RUNTIME} Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-vram-group kimi-vram-tier)
         # Real-pack, RAM-only crossover measurement for grouped DeepSeek-V4.1
         # prefill.  It is a manually-run performance tool (owned GPU, 7 GB/s
         # H2D governor and 16 GiB cgroup required), so it is intentionally not
         # registered with ctest.
         add_executable(test-kimi-prefill-crossover ssd/test-kimi-prefill-crossover.cpp)
+        ssd_gpu_test_language(test-kimi-prefill-crossover)
         target_compile_features(test-kimi-prefill-crossover PRIVATE cxx_std_17)
         target_compile_options(test-kimi-prefill-crossover PRIVATE -fno-fast-math -ffp-contract=off)
         target_include_directories(test-kimi-prefill-crossover PRIVATE ../ggml/src ../ggml/src/ggml-cpu
             ../ggml/src/ggml-cuda/ssd ../vendor)
-        target_link_libraries(test-kimi-prefill-crossover PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda
-            CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+        target_link_libraries(test-kimi-prefill-crossover PRIVATE ggml-ssd-host ggml-cpu ggml-base ${SSD_GPU_BACKEND}
+            ${SSD_GPU_RUNTIME} Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-prefill-crossover kimi-mxfp4-parity kimi-vram-tier)
         # The error fixture explicitly injects callbacks around the real linked component.
-        target_link_libraries(test-kimi-vram-elastic PRIVATE ggml-cuda)
-        target_link_libraries(test-kimi-vram-reclaim PRIVATE ggml-cuda)
+        target_link_libraries(test-kimi-vram-elastic PRIVATE ${SSD_GPU_BACKEND})
+        target_link_libraries(test-kimi-vram-reclaim PRIVATE ${SSD_GPU_BACKEND})
     endif()
     if (TARGET kimi-vram-tier AND LLAMA_SSD_STORE)
         add_executable(test-ssd-dense-stream ssd/test-dense-stream.cpp)
         target_compile_features(test-ssd-dense-stream PRIVATE cxx_std_17)
         target_include_directories(test-ssd-dense-stream PRIVATE ../src ../include ../ggml/src)
-        target_link_libraries(test-ssd-dense-stream PRIVATE llama ggml-cuda ggml-cpu ggml-ssd)
+        target_link_libraries(test-ssd-dense-stream PRIVATE llama ${SSD_GPU_BACKEND} ggml-cpu ggml-ssd)
         add_test(NAME ssd_dense_stream COMMAND test-ssd-dense-stream)
         set_tests_properties(ssd_dense_stream PROPERTIES LABELS main TIMEOUT 120)
     endif()
@@ -395,6 +442,7 @@ if (TARGET ggml-cpu)
     add_test(NAME kimi_cpu_sink COMMAND test-kimi-cpu-sink)
     add_test(NAME dsv41_q2_cpu_sink_decode COMMAND test-kimi-cpu-sink
         --q2-activation-test --threads 9 --ring-experts 8)
+    add_test(NAME kimi_cpu_sink_drop COMMAND test-kimi-cpu-sink --drop-test --threads 4 --ring-experts 8)
     add_executable(test-kimi-cpu-cache-policy ssd/test-kimi-cpu-cache-policy.cpp)
     target_include_directories(test-kimi-cpu-cache-policy PRIVATE ../ggml/src)
     target_link_libraries(test-kimi-cpu-cache-policy PRIVATE ggml-ssd-host ggml-base)
@@ -917,7 +965,7 @@ foreach(resource_test IN LISTS ssdash_registered_tests)
         else()
             set_property(TEST ${resource_test} APPEND PROPERTY LABELS device)
             set_property(TEST ${resource_test} PROPERTY SKIP_RETURN_CODE 77)
-            if (NOT resource_test MATCHES "^(kimi_cpu_sink|kimi_cpu_sink_schedule_invalid|kimi_cpu_sink_threadpool|kimi_cpu_sink_threadpool_poll|kimi_cpu_sink_swiglu|kimi_cpu_sink_swiglu_ordinary|kimi_cpu_sink_registered|kimi_cpu_sink_trace_profile|dsv41_q2_cpu_sink_decode|kimi_cpu_prefill|kimi_cpu_prefill_registered)$")
+            if (NOT resource_test MATCHES "^(kimi_cpu_sink|kimi_cpu_sink_schedule_invalid|kimi_cpu_sink_threadpool|kimi_cpu_sink_threadpool_poll|kimi_cpu_sink_swiglu|kimi_cpu_sink_swiglu_ordinary|kimi_cpu_sink_registered|kimi_cpu_sink_trace_profile|kimi_cpu_sink_drop|dsv41_q2_cpu_sink_decode|kimi_cpu_prefill|kimi_cpu_prefill_registered)$")
                 set_property(TEST ${resource_test} APPEND PROPERTY LABELS ${ssd_envelope_label})
             endif()
         endif()

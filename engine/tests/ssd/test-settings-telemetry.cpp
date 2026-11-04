@@ -47,8 +47,24 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 13);
+    assert(registry().size() == 20);
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
+    // the expert predictor: traced requests, the tier prior and the file that keeps them
+    {
+        auto traced = parse("inferssd-settings 1\ntrace.capacity=8\ntrace.prior=0\ntrace.file=[\"/var/trace.bin\"]\n", "trace.ssd");
+        assert(traced);
+        assert(*traced.value.integer("trace.capacity") == 8 && *traced.value.integer("trace.prior") == 0);
+        assert(traced.value.paths("trace.file") && *traced.value.paths("trace.file") == std::vector<std::string>({ "/var/trace.bin" }));
+        assert(!parse("inferssd-settings 1\ntrace.prior=2\n", "trace-invalid.ssd"));
+        assert(!parse("inferssd-settings 1\ntrace.capacity=1025\n", "trace-invalid.ssd"));
+        auto warm = parse("inferssd-settings 1\nvram.warm_mib=512\nvram.warm_bits=2\n", "warm.ssd");
+        assert(warm && *warm.value.integer("vram.warm_mib") == 512 && *warm.value.integer("vram.warm_bits") == 2);
+        assert(!parse("inferssd-settings 1\nvram.warm_bits=8\n", "warm-invalid.ssd"));
+        auto defaults = parse("", "");
+        assert(defaults && *defaults.value.integer("trace.capacity") == 32 && *defaults.value.integer("trace.prior") == 1);
+        assert(defaults.value.paths("trace.file") && defaults.value.paths("trace.file")->empty());
+        assert(*defaults.value.integer("vram.warm_mib") == 0 && *defaults.value.integer("vram.warm_bits") == 4);
+    }
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
     assert(base);

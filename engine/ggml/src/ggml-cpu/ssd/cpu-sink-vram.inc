@@ -11,10 +11,12 @@ struct sink_vram {
     const kimi_vram_prefill_api * prefill_api = nullptr;
     const kimi_vram_elastic_api * elastic = nullptr;
     bool format_path = false;
+    std::vector<kimi_vram_layer_format> layer_formats; // every routed layer's, from the model (kimi_cpu_sink_expert_formats)
     void * context = nullptr;
     std::vector<kimi_vram_request> requests;
     std::vector<int> slots;
     int hits = 0;
+    uint64_t warm_hits = 0; // requests served from the tier's warm pool, over the sink's life
     bool format_f32_input = false;
     bool format_mxfp4_input = false;
     bool mxfp4_batch_enabled = true;
@@ -65,6 +67,7 @@ struct sink_vram {
     const kimi_vram_host_api * host_api = nullptr;
     uint64_t host_experts = 0;
     const kimi_vram_policy_api * policy_api = nullptr; // optional: miss cost, host demand and floor, host reclaim
+    const kimi_vram_prior_api * prior_api = nullptr;   // optional: a request's predicted selections (trace.prior)
     // The CPUs the tier's threads were given (policy set_thread_cpus): those of the run's coordinator, which waits for
     // them. Read at the first layer on the tier after each begin, once ggml has placed the graph's threads.
     ssd::platform::cpu_list thread_cpus, coordinator_cpus;
@@ -188,6 +191,13 @@ struct sink_vram {
                 throw std::runtime_error("GPU tier admission-policy ABI mismatch");
             }
         }
+        if (configuration.gpu.prior) {
+            prior_api = configuration.gpu.prior;
+            if (prior_api->version != 1 || prior_api->size != sizeof(*prior_api) || !prior_api->set_prior ||
+                    !prior_api->take_prompt || !prior_api->lookahead) {
+                throw std::runtime_error("GPU tier prior ABI mismatch");
+            }
+        }
         if (configuration.gpu.host) {
             host_api = configuration.gpu.host;
             if (!host_api || host_api->version != 3 || host_api->size != sizeof(*host_api) ||
@@ -217,6 +227,7 @@ struct sink_vram {
     void check(int result, const char * error) {
         if (result) { throw std::runtime_error(std::string("GPU tier: ") + error); }
     }
+    const kimi_vram_layer_format * formats() const { return layer_formats.empty() ? nullptr : layer_formats.data(); }
     // The tier's threads on the CPUs of this thread, the coordinator, when they changed since the last placement.
     void place_threads() {
         if (!placement_due || !policy_api) { return; }
@@ -272,7 +283,7 @@ struct sink_vram {
         const ggml_tensor * tensors[] = { up, gate, down };
         for (int role = 0; role < 3; ++role) { r.role[role].bytes = tensors[role]->nb[2]; }
         const kimi_vram_expert_format f = { int32_t(up->ne[0]), int32_t(up->ne[1]), int32_t(up->type),
-            int32_t(down->type), int32_t(up->ne[2]), int32_t(layer_ids.size()), layer_ids.data() };
+            int32_t(down->type), int32_t(up->ne[2]), int32_t(layer_ids.size()), layer_ids.data(), formats() };
         char error[512] = {};
         check(elastic->reserve(context, &r, &f, error, sizeof(error)), error);
     }
@@ -283,6 +294,35 @@ struct sink_vram {
         check(elastic->phase_complete(context, decode ? 1 : 0, error, sizeof(error)), error);
     }
     // Expert geometry is supplied through the explicit-format extension.
+    // An expert's identity in the tier: its layer, id and source files.
+    static kimi_vram_request request_key(int32_t layer, const sink_request & source, float weight) {
+        kimi_vram_request r = {};
+        r.layer = layer; r.expert = source.id; r.weight = weight;
+        for (int role = 0; role < 3; ++role) {
+            const auto k = sink_cache::key(source.role[role]);
+            r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes,
+                            k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
+        }
+        return r;
+    }
+    // A predicted expert of `layer` goes up from its RAM slot `entry` (kimi_vram_prior_api::lookahead). True when it
+    // went: the slot then stays leased, as for a deferred admission, until collect_deferred returns it.
+    bool lookahead(int32_t layer, const sink_request & source, int entry, float probability, sink_cache & cache) {
+        if (!context || !prior_api || !deferred_upload) { return false; }
+        const void * data[3];
+        for (int role = 0; role < 3; ++role) { data[role] = cache.data(entry, role) + source.role[role].data_offset; }
+        const kimi_vram_request r = request_key(layer, source, 1.0f);
+        cache.acquire_lease(entry, source);
+        char error[512] = {};
+        int queued = 0;
+        const int result = prior_api->lookahead(context, &r, data[0], data[1], data[2], probability, &queued, error, sizeof(error));
+        if (result || !queued) { cache.release_lease(entry); }
+        check(result, error);
+        if (!queued) { return false; }
+        deferred.push_back({ r, source, entry, cache.generation });
+        ++deferred_queued;
+        return true;
+    }
     void prepare(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * down,
                  int latent, int hidden, const std::vector<int32_t> & layer_ids, sink_cache & cache, bool unweighted = false) {
         hits = 0;
@@ -304,14 +344,7 @@ struct sink_vram {
         }
         upload_queued.assign(source.size(), 0);
         requests.resize(source.size()); slots.assign(source.size(), -1);
-        for (size_t i = 0; i < source.size(); ++i) {
-            auto & r = requests[i]; r.layer = layer; r.expert = source[i].id; r.weight = unweighted ? 1.0f : source[i].weight;
-            for (int role = 0; role < 3; ++role) {
-                const auto k = sink_cache::key(source[i].role[role]);
-                r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes,
-                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
-            }
-        }
+        for (size_t i = 0; i < source.size(); ++i) { requests[i] = request_key(layer, source[i], unweighted ? 1.0f : source[i].weight); }
         char error[512] = {};
         int result;
         {
@@ -319,13 +352,17 @@ struct sink_vram {
             // backend has a matrix-vector kernel for; it refuses the rest) takes it as f32
             const bool mxfp4 = up->type == GGML_TYPE_MXFP4 && down->type == GGML_TYPE_MXFP4;
             const kimi_vram_expert_format f = { latent, hidden, int32_t(up->type), int32_t(down->type),
-                int32_t(up->ne[2]), int32_t(layer_ids.size()), layer_ids.data() };
+                int32_t(up->ne[2]), int32_t(layer_ids.size()), layer_ids.data(), formats() };
             result = format->prepare(context, requests.data(), int(requests.size()), &f, slots.data(), error, sizeof(error));
             format_f32_input = !mxfp4;
         }
         format_path = true;
         check(result, error);
-        for (size_t i = 0; i < source.size(); ++i) { source[i].vram_slot = slots[i]; hits += slots[i] >= 0; }
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i].vram_slot = slots[i];
+            hits += slots[i] >= 0;
+            warm_hits += slots[i] >= KIMI_VRAM_WARM_SLOT;
+        }
     }
     void launch(const void * quantized, size_t quantized_bytes, const float * f32, size_t f32_bytes,
                 const kimi_cpu_sink_activation & activation) {
@@ -454,16 +491,9 @@ struct sink_vram {
         prefill_latent = latent;
         if (!learning.window) { learning.window = std::max<size_t>(1, layer_ids.size()); }
         requests.resize(source.size()); slots.assign(source.size(), -1);
-        for (size_t i = 0; i < source.size(); ++i) {
-            auto & r = requests[i]; r.layer = layer; r.expert = source[i].id; r.weight = 1.0f;
-            for (int role = 0; role < 3; ++role) {
-                const auto k = sink_cache::key(source[i].role[role]);
-                r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes,
-                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
-            }
-        }
+        for (size_t i = 0; i < source.size(); ++i) { requests[i] = request_key(layer, source[i], 1.0f); }
         const kimi_vram_expert_format f = { latent, hidden, int32_t(up->type), int32_t(down->type),
-            int32_t(up->ne[2]), int32_t(layer_ids.size()), layer_ids.data() };
+            int32_t(up->ne[2]), int32_t(layer_ids.size()), layer_ids.data(), formats() };
         char error[512] = {};
         check(prefill_api->prepare(context, requests.data(), int(requests.size()), &f,
                 slots.data(), error, sizeof(error)), error);

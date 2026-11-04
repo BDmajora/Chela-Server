@@ -130,7 +130,7 @@ int main(int argc, char * argv[]) {
     bool failed = false;
 
     // Removed slots must be rejected before size/block modulo, even for zero bytes.
-    for (int id : {-1, 4, 5, 31, 32, 33, 36, 37, 38, 42, int(GGML_TYPE_COUNT)}) {
+    for (int id : {-1, 4, 5, 31, 32, 33, 36, 37, 38, int(GGML_TYPE_COUNT)}) {
         for (size_t bytes : {size_t(0), size_t(129)}) {
             if (ggml_validate_row_data(ggml_type(id), nullptr, bytes)) {
                 fprintf(stderr, "validation accepted unsupported type %d\n", id);
@@ -160,6 +160,7 @@ int main(int argc, char * argv[]) {
                 type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
@@ -185,7 +186,7 @@ int main(int argc, char * argv[]) {
                                           ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                                           : type == GGML_TYPE_Q1_0
                                           ? MAX_DOT_PRODUCT_ERROR_BINARY
-                                          : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0
+                                          : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
                                           : type == GGML_TYPE_NVFP4
                                           ? MAX_DOT_PRODUCT_ERROR_FP4

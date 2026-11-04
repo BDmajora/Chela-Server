@@ -76,4 +76,7 @@ struct kimi_cpu_sink_cache_stats {
     uint64_t prefill_misses;
     uint64_t prefill_hit_bytes;
     uint64_t prefill_leases;          // successfully acquired read-only leases
+    uint64_t prior_layers;            // GPU tier layers that took a request's predicted selections (trace.prior)
+    uint64_t lookahead_uploads;       // predicted experts uploaded ahead of their selection (vram.lookahead)
+    uint64_t warm_hits;               // requests the GPU tier served from a low-precision copy (vram.warm_mib)
 };

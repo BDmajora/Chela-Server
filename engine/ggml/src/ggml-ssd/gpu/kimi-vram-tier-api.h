@@ -6,6 +6,9 @@
 #include "../platform/file.h"
 #endif
 
+// A slot prepare gives from this value up is a warm pool copy (vram.warm_mib): computed by the GPU like any resident,
+// at lower precision; the table does not hold it. A caller reads a slot's sign, and whether it is a warm one from here.
+#define KIMI_VRAM_WARM_SLOT (1 << 30)
 // Private optional transport ABI. The CPU backend remains CUDA independent.
 // Every function except destroy returns 0 on success. Errors must drain work
 // before payload/input/output ownership is returned to the caller.
@@ -89,7 +92,9 @@ struct kimi_vram_residency_api {
 // format the CPU owner calls prepare (with the tensor geometry) instead of ABI 2
 // prepare and launch (with the activation) instead of ABI 2 launch; admit,
 // finish, cancel, begin and the residency ABI are shared. The format, including
-// the layer list, must stay the same for the lifetime of a context.
+// the layer list, must stay the same for the lifetime of a context. Layers share
+// their geometry and may differ in their types: a quantizer picks a layer's types
+// by its weights, and then layer_formats names them all before the first prepare.
 enum kimi_vram_activation_kind {
     KIMI_VRAM_ACTIVATION_SITU         = 0, // same values as kimi_cpu_sink_activation_kind
     KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP = 1,
@@ -99,13 +104,22 @@ struct kimi_vram_activation {
     int32_t kind;
     float situ_beta, situ_linear_beta, swiglu_limit;
 };
+// One routed layer's types and the logical bytes of one of its experts, per role (tensor nb[2]).
+struct kimi_vram_layer_format {
+    int32_t layer;
+    int32_t weight_type, down_type;
+    uint64_t role_bytes[3];
+};
 struct kimi_vram_expert_format {
     int32_t latent, hidden;   // up/gate columns and rows
-    int32_t weight_type;      // ggml_type of up and gate
-    int32_t down_type;        // ggml_type of down
+    int32_t weight_type;      // ggml_type of this layer's up and gate
+    int32_t down_type;        // ggml_type of this layer's down
     int32_t n_experts;        // routed experts per layer (tensor ne[2])
     int32_t n_layers;         // entries in layers
     const int32_t * layers;   // model layer IDs, allocation priority order
+    // n_layers entries, one for each of layers, in any order; null: every layer has this
+    // layer's types and the request's role bytes.
+    const struct kimi_vram_layer_format * layer_formats;
 };
 struct kimi_vram_format_api {
     uint32_t version, size;   // 1
@@ -371,6 +385,29 @@ struct kimi_vram_policy_api {
     uint64_t (*host_bytes)(void * context);
     int (*set_thread_cpus)(void * context, const int * cpus, int count, char * error, size_t error_size);
 };
+// Optional prior extension: a request's predicted decode selections (ssd::place::expert_predictor), as selections
+// per decode token of each of the `count` routed experts of `layer`. The tier starts the request's decode from them
+// instead of the previous request's heat (vram_slot_table::set_prior): its admissions and evictions then price the
+// experts the request is expected to use as if it had used them. Between the layers of a decode token (after begin,
+// before that layer's prepare) with no live lease. *applied is 1 when the tier took them; 0 when it has no count policy,
+// no format yet (its first decode prepare makes one) or does not serve the layer. A refusal (another phase, another
+// expert count) changes nothing and drains nothing. 0 on success.
+// take_prompt: the routes each of `count` experts of `layer` took in the graph prefill passes since the last call
+// (a graph pass routes outside the sink: the scheduler offers the tier its counts with its seeds), then clears them.
+// *any is 1 when the layer has routes. For the predictor at a request's first decode token.
+// lookahead: an expert a later layer is predicted to select, with `probability` that it does, goes up ahead of its
+// selection (vram.lookahead): on prepare's terms, its count with that selection weighed by the probability against the
+// victim's and the upload's price, in a slot reserved for a deferred upload. *queued is 1 when it went: the caller
+// keeps the source unchanged and leased until collect returns the request, as for a deferred admit. Any phase of a
+// decode token with no live lease; 0 with *queued 0 when the tier holds it or has no victim worth it.
+struct kimi_vram_prior_api {
+    uint32_t version, size;   // 1
+    int (*set_prior)(void * context, int32_t layer, const float * rates, int count, int * applied,
+                     char * error, size_t error_size);
+    void (*take_prompt)(void * context, int32_t layer, int32_t * routes, int count, int * any);
+    int (*lookahead)(void * context, const struct kimi_vram_request * request, const void * up, const void * gate,
+                     const void * down, float probability, int * queued, char * error, size_t error_size);
+};
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -383,6 +420,7 @@ typedef const struct kimi_vram_deferred_api * (*kimi_vram_deferred_get_api_fn)(v
 typedef const struct kimi_vram_elastic_api * (*kimi_vram_elastic_get_api_fn)(void);
 typedef const struct kimi_vram_host_api * (*kimi_vram_host_get_api_fn)(void);
 typedef const struct kimi_vram_policy_api * (*kimi_vram_policy_get_api_fn)(void);
+typedef const struct kimi_vram_prior_api * (*kimi_vram_prior_get_api_fn)(void);
 const struct kimi_vram_elastic_api * kimi_vram_elastic_get_api(void);
 #ifdef __cplusplus
 }

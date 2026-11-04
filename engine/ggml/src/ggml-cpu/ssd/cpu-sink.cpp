@@ -7,6 +7,7 @@
 #include "ggml-ssd/gpu-tier-settings.h"
 #include "ggml-ssd/telemetry/telemetry.h"
 #include "ggml-ssd/place/runtime-policy.h"
+#include "ggml-ssd/place/expert-trace.h"
 #include "ggml-ssd/host/page-lock.h"
 #include "ggml-ssd/gpu/kimi-cache-location-api.h"
 #include "ggml-ssd/host/arbiter.h"
@@ -25,6 +26,7 @@
 #include <bitset>
 #include <chrono>
 #include <climits>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstdarg>
@@ -530,6 +532,53 @@ struct sink_mrc {
     }
 };
 
+// Request-level expert prediction (ssd::place::expert_predictor; trace.capacity, trace.prior, trace.file): the prompt's
+// routes and decode's selections go in at the sink's synchronization points; each request's predicted selections go
+// to the GPU tier before its first decode prepare (trace.prior); the traces and the profile persist in trace.file,
+// written at request boundaries (at most every 30 s) and at destruction through a temporary file renamed over it. The
+// predictor is sized at the first run after the RAM cache knows its routed layers; a geometry it cannot predict
+// leaves it off.
+struct sink_prediction {
+    ssd::place::expert_predictor predictor;
+    bool requested = false, prior = false, configured = false;
+    size_t capacity = 0;
+    std::string file, fingerprint;
+    std::vector<uint64_t> applied; // per layer: the prediction (predictor.predictions()) the tier took for it
+    uint64_t ram_applied = 0;      // the prediction the RAM cache took
+    uint64_t taken = 0, refused = 0, saves = 0, save_failures = 0, saved_requests = 0;
+    std::chrono::steady_clock::time_point saved_at;
+};
+
+// The GPU tier's lookahead (vram.lookahead): while a layer runs, the highest-ranked experts its hint predicts for the
+// next layer that sit in the RAM cache and that the tier does not hold go up ahead of their selection, on a deferred
+// upload that overlaps the layer's compute (MoE-Infinity's asynchronous streaming of predicted experts, from the router
+// lookahead). The next layer's prepare waits for them, as a layer's RAM slots cannot move under an upload, so only as
+// many go as their measured copies fit in the measured time to that prepare. A rank's probability is how often the
+// next layer selected an expert of that rank that the tier did not hold; it weighs the expert's admission.
+struct sink_lookahead {
+    int depth = 0;
+    double lead_us = 0; // from a layer's schedule to the next layer's run
+    std::chrono::steady_clock::time_point scheduled;
+    int32_t layer = -1; // the layer the hint below predicts, until its run
+    int n = 0;
+    int32_t hint[64] = {};
+    bool open[64] = {}; // rank not held by the tier at the schedule
+    double seen[64] = {}, selected[64] = {}; // per rank, decayed
+    uint64_t asked = 0, queued = 0, out_of_time = 0, not_in_ram = 0;
+    double probability(int rank) const { return (selected[rank] + 1.0) / (seen[rank] + 2.0); }
+};
+
+// Decode's approximate routing (decode.drop_mass, ssd::place::plan_expert_drop). A dropped slot is an id of -1 and the
+// kept weights are scaled back up in the run's own copy; the caches and the predictor keep seeing the router's picks.
+struct sink_drop {
+    double budget = 0;
+    std::vector<int32_t> ids;
+    std::vector<float> weights;
+    std::vector<uint8_t> marked, resident;
+    uint64_t layers = 0, dropped = 0, kept = 0;
+    double mass = 0;
+};
+
 struct kimi_cpu_sink {
     const sink_configuration configuration;
     const int ring_experts;
@@ -699,6 +748,9 @@ struct kimi_cpu_sink {
     bool trace_has_token = false, trace_decode = false;
     int trace_layer = -1;
     sink_mrc mrc;
+    sink_prediction prediction;
+    sink_lookahead lookahead;
+    sink_drop drop;
     double caller_cpu_start = 0;
     sink_clock::time_point phase_dispatch;
     std::vector<sink_worker_profile> worker_profiles; // one per participant of the open call
@@ -781,6 +833,18 @@ struct kimi_cpu_sink {
             throw std::runtime_error("DYNAMIC_ROWS and ROW_WEIGHTS are mutually exclusive row schedulers");
         }
         vram.initialize(ready_first, configuration);
+        prediction.capacity = configuration.policy.trace_capacity;
+        prediction.prior = configuration.policy.trace_prior;
+        prediction.file = configuration.policy.trace_file;
+        prediction.requested = prediction.capacity || prediction.prior || !prediction.file.empty();
+        if (configuration.policy.vram_lookahead < 0 || configuration.policy.vram_lookahead > 16) {
+            throw std::runtime_error("VRAM lookahead must be 0..16");
+        }
+        lookahead.depth = vram.deferred_upload && vram.prior_api ? configuration.policy.vram_lookahead : 0;
+        if (configuration.policy.drop_mass < 0 || configuration.policy.drop_mass > 50) {
+            throw std::runtime_error("decode drop mass must be 0..50 percent");
+        }
+        drop.budget = double(configuration.policy.drop_mass) / 100.0;
         refresh_floor("init");
         if (vram.deferred_upload) {
             cache.before_release = [](void * p) { static_cast<sink_vram *>(p)->wait_deferred(); };
@@ -837,6 +901,168 @@ struct kimi_cpu_sink {
             throw;
         }
         if (prefetch.topk) { std::fprintf(stderr, "[kimi_cpu_sink_prefetch] enabled topk=%d readers=3\n", prefetch.topk); }
+    }
+
+    // The expert predictor (sink_prediction). Sized once, at the first run after the RAM cache knows its routed layers:
+    // the layers up to the highest routed one, the experts of the run's tensors; the trace file is read then, for this
+    // geometry and expert types only (another model's file is left as it is and replaced at the next save).
+    void prediction_configure(const ggml_tensor * up, const ggml_tensor * down) {
+        auto & p = prediction;
+        if (p.configured || !p.requested || cache.layers.empty() || !up || !down) { return; }
+        p.configured = true;
+        int32_t layers = 0;
+        for (const auto & l : cache.layers) { layers = std::max<int32_t>(layers, l.id + 1); }
+        const int32_t experts = int32_t(up->ne[2]);
+        if (!p.predictor.configure(layers, experts, p.capacity)) {
+            std::fprintf(stderr, "[kimi_expert_trace] enabled=0 reason=geometry layers=%d experts=%d\n", layers, experts);
+            return;
+        }
+        p.applied.assign(size_t(layers), 0);
+        char fingerprint[256];
+        std::snprintf(fingerprint, sizeof(fingerprint), "layers=%d experts=%d latent=%lld hidden=%lld up=%s down=%s",
+            layers, experts, (long long) up->ne[0], (long long) up->ne[1], ggml_type_name(up->type), ggml_type_name(down->type));
+        p.fingerprint = fingerprint;
+        std::string loaded = "none";
+        if (!p.file.empty()) {
+            std::string why;
+            loaded = prediction_load(why) ? "loaded" : why;
+        }
+        std::fprintf(stderr, "[kimi_expert_trace] enabled=1 layers=%d experts=%d capacity=%zu prior=%d file=%s load=%s traced=%zu\n",
+            layers, experts, p.capacity, int(p.prior), p.file.empty() ? "none" : "set", loaded.c_str(), p.predictor.traced());
+    }
+    bool prediction_load(std::string & why) {
+        auto & p = prediction;
+        std::FILE * f = std::fopen(p.file.c_str(), "rb");
+        if (!f) { why = errno == ENOENT ? "absent" : std::strerror(errno); return false; }
+        std::string bytes;
+        char chunk[1 << 16];
+        size_t n = 0;
+        while ((n = std::fread(chunk, 1, sizeof(chunk), f)) > 0) {
+            bytes.append(chunk, n);
+            if (bytes.size() > (size_t(1) << 30)) { std::fclose(f); why = "too large"; return false; }
+        }
+        const bool failed = std::ferror(f) != 0;
+        std::fclose(f);
+        if (failed) { why = "read failed"; return false; }
+        return p.predictor.deserialize(bytes, p.fingerprint, &why);
+    }
+    // At a request boundary (force: at destruction): the predictor's state, once it traced a request since the last
+    // write and 30 s have passed, through a temporary file renamed over the old one.
+    void prediction_save(bool force) {
+        auto & p = prediction;
+        if (!p.predictor.enabled() || p.file.empty() || p.predictor.requests() == p.saved_requests) { return; }
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && p.saves && now - p.saved_at < std::chrono::seconds(30)) { return; }
+        const std::string bytes = p.predictor.serialize(p.fingerprint);
+        const std::string temporary = p.file + ".tmp";
+        std::FILE * f = std::fopen(temporary.c_str(), "wb");
+        bool ok = f && std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+        if (f) { ok = std::fclose(f) == 0 && ok; }
+#if defined(_WIN32)
+        if (ok) { std::remove(p.file.c_str()); } // rename does not replace a file on Windows
+#endif
+        ok = ok && std::rename(temporary.c_str(), p.file.c_str()) == 0;
+        if (!ok) {
+            std::remove(temporary.c_str());
+            if (!p.save_failures++) { std::fprintf(stderr, "[kimi_expert_trace] save failed: %s\n", std::strerror(errno)); }
+            return;
+        }
+        p.saved_requests = p.predictor.requests();
+        p.saved_at = now;
+        ++p.saves;
+    }
+    // A prefill (grouped prefill's layer): the routes of each distinct expert, from the batch's token-major routes.
+    void prediction_prompt(const ggml_tensor * up, const ggml_tensor * down, const int32_t * ids, int nexperts,
+            const kimi_cpu_sink_prefill_batch & batch) {
+        prediction_configure(up, down);
+        auto & p = prediction;
+        if (!p.predictor.enabled() || nexperts <= 0) { return; }
+        int layer = -1, consumed = 0;
+        if (std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) != 1 || !consumed || up->name[consumed]) { return; }
+        std::vector<int32_t> routes(size_t(nexperts), 0);
+        const size_t count = size_t(batch.nslots) * size_t(batch.ntokens);
+        for (size_t r = 0; r < count; ++r) {
+            const int32_t i = batch.route_request_index[r];
+            if (i >= 0 && i < nexperts) { ++routes[size_t(i)]; }
+        }
+        p.predictor.observe_prompt(layer, ids, routes.data(), nexperts);
+        p.predictor.observe_prompt_tokens(layer, uint64_t(batch.ntokens));
+    }
+    // A decode run, before its prepare: its selections go in, and the request's first run takes in the routes of its
+    // graph prefill passes, which the tier saw, and fixes the prediction.
+    void prediction_decode(const ggml_tensor * up, const ggml_tensor * down, int layer, const int32_t * ids, int n) {
+        prediction_configure(up, down);
+        auto & p = prediction.predictor;
+        if (!p.enabled()) { return; }
+        if (!p.decoding() && vram.context && vram.prior_api) {
+            const int32_t experts = p.experts();
+            std::vector<int32_t> routes(static_cast<size_t>(experts)), every(static_cast<size_t>(experts));
+            for (int32_t e = 0; e < experts; ++e) { every[size_t(e)] = e; }
+            for (int32_t l = 0; l < p.layers(); ++l) {
+                int any = 0;
+                vram.prior_api->take_prompt(vram.context, l, routes.data(), experts, &any);
+                if (any) { p.observe_prompt(l, every.data(), routes.data(), experts); }
+            }
+        }
+        p.observe_decode(layer, ids, n);
+        prediction_apply();
+    }
+    // Between layers: the request's predicted selections to the expert caches, every layer the tier has not taken them
+    // for yet (all at once at the request's first run, so that a global pool compares layers on one footing; a tier
+    // still without its format takes them at the following layers).
+    void prediction_apply() {
+        auto & p = prediction;
+        if (!p.prior || !p.predictor.predicted()) { return; }
+        const uint64_t generation = p.predictor.predictions();
+        if (p.ram_applied != generation) {
+            p.ram_applied = generation;
+            for (const auto & l : cache.layers) {
+                if (const float * rates = p.predictor.rates(l.id)) { cache.set_prior(l.id, rates, size_t(p.predictor.experts())); }
+            }
+        }
+        if (!vram.context || !vram.prior_api) { return; }
+        for (int32_t layer = 0; layer < p.predictor.layers(); ++layer) {
+            if (p.applied[size_t(layer)] == generation) { continue; }
+            const float * rates = p.predictor.rates(layer);
+            if (!rates) { continue; }
+            int applied = 0;
+            char error[256] = {};
+            if (vram.prior_api->set_prior(vram.context, layer, rates, p.predictor.experts(), &applied, error, sizeof(error))) {
+                ++p.refused;
+                p.applied[size_t(layer)] = generation; // not again for this request
+                continue;
+            }
+            if (applied) { ++p.taken; p.applied[size_t(layer)] = generation; }
+        }
+    }
+    // A prefill begins: the request before it ends (traced, folded into the profile) and the state may be written.
+    void prediction_boundary() {
+        auto & p = prediction;
+        if (!p.predictor.enabled() || !p.predictor.decoding()) { return; }
+        p.predictor.finish_request();
+        prediction_save(false);
+        prediction_report("request");
+    }
+    void prediction_report(const char * reason) {
+        auto & p = prediction.predictor;
+        if (!p.enabled() || !p.scored()) { return; }
+        const auto & w = p.weights();
+        std::fprintf(stderr, "[kimi_expert_trace] reason=%s requests=%llu traced=%zu scored=%llu recall=%.3f mean_p=%.4f "
+            "uniform_p=%.4f similarity=%.3f priors=%llu refused=%llu saves=%llu weights=",
+            reason, (unsigned long long) p.requests(), p.traced(), (unsigned long long) p.scored(), p.recall(),
+            p.mean_probability(), p.mean_source_probability(ssd::place::expert_predictor::uniform_source), p.best_similarity(),
+            (unsigned long long) prediction.taken, (unsigned long long) prediction.refused, (unsigned long long) prediction.saves);
+        for (int s = 0; s < ssd::place::expert_predictor::source_count; ++s) {
+            std::fprintf(stderr, "%s%s:%.3f", s ? "," : "", ssd::place::expert_predictor::source_name(s), w[size_t(s)]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+    void prediction_finish() {
+        auto & p = prediction.predictor;
+        if (!p.enabled()) { return; }
+        if (p.decoding()) { p.finish_request(); }
+        prediction_save(true);
+        prediction_report("destroy");
     }
 
     // The context's reclaimer (ssd::host::actions), which the host arbiter runs for every admission of the context
@@ -1166,6 +1392,85 @@ struct kimi_cpu_sink {
     // Called by a decode run after its own reads were published: the statistics of the hint it got for the next
     // layer, then the reads of its first k ranks. A run without reads of its own opens the drive's idle window here,
     // with a hint or without one.
+    // sink_drop: fills the run's ids and weights when experts go; false leaves the router's.
+    bool plan_drop(int32_t layer, const int32_t * ids, const float * weights, int n) {
+        auto & d = drop;
+        if (!(d.budget > 0.0) || n <= 0 || n > 1024) { return false; }
+        d.resident.assign(size_t(n), 0);
+        if (vram.context) { vram.held(layer, ids, n, d.resident.data()); }
+        else {
+            for (int i = 0; i < n; ++i) { d.resident[size_t(i)] = uint8_t(ids[i] >= 0 && cache.holds(layer, ids[i])); }
+        }
+        const double scale = ssd::place::plan_expert_drop(ids, weights, d.resident.data(), n, d.budget, d.marked);
+        ++d.layers;
+        if (scale == 1.0) { for (int i = 0; i < n; ++i) { d.kept += ids[i] >= 0; } return false; }
+        d.ids.assign(ids, ids + n); d.weights.assign(weights, weights + n);
+        for (int i = 0; i < n; ++i) {
+            if (d.marked[size_t(i)]) { d.ids[size_t(i)] = -1; ++d.dropped; d.mass += weights[i]; continue; }
+            d.kept += ids[i] >= 0;
+            d.weights[size_t(i)] = float(double(weights[i]) * scale);
+        }
+        return true;
+    }
+    void drop_report() {
+        const auto & d = drop;
+        if (!(d.budget > 0.0) || !d.layers) { return; }
+        std::fprintf(stderr, "[kimi_expert_drop] budget=%.2f layers=%llu dropped=%llu kept=%llu mass_per_layer=%.4f\n", d.budget,
+            (unsigned long long) d.layers, (unsigned long long) d.dropped, (unsigned long long) d.kept, d.mass / double(d.layers));
+    }
+    // sink_lookahead: the hint's experts in RAM that the tier does not hold, as far as the link has time before the
+    // next layer's prepare.
+    void lookahead_schedule(int32_t next, int nhint, const uint8_t * held) {
+        auto & a = lookahead;
+        if (!a.depth || !vram.context || !vram.decode || !vram.host_api) { return; }
+        a.layer = next; a.n = nhint;
+        a.scheduled = std::chrono::steady_clock::now();
+        for (int i = 0; i < nhint; ++i) { a.hint[i] = prefetch.hint[i]; a.open[i] = prefetch.hint[i] >= 0 && !held[i]; }
+        kimi_vram_host_costs c = {};
+        vram.host_api->costs2(vram.context, &c);
+        const double upload_us = double(cache.stride) / 1e6 * (c.pageable_us_per_mb > 0 ? c.pageable_us_per_mb : c.copy_us_per_mb);
+        if (!cache.arena || !(upload_us > 0) || !(a.lead_us > 0)) { return; }
+        int budget = int((a.lead_us - c.link_busy_us) / upload_us);
+        char names[3][GGML_MAX_NAME];
+        std::snprintf(names[0], sizeof(names[0]), "blk.%d.ffn_up_exps.weight", next);
+        std::snprintf(names[1], sizeof(names[1]), "blk.%d.ffn_gate_exps.weight", next);
+        std::snprintf(names[2], sizeof(names[2]), "blk.%d.ffn_down_exps.weight", next);
+        for (int i = 0; i < nhint && i < a.depth; ++i) {
+            if (!a.open[i]) { continue; }
+            ++a.asked;
+            if (budget <= 0) { ++a.out_of_time; continue; }
+            sink_request r{};
+            r.id = prefetch.hint[i];
+            bool resolved = true;
+            for (int role = 0; role < 3 && resolved; ++role) { resolved = resolver(userdata, names[role], r.id, &r.role[role]); }
+            const int entry = resolved ? cache.find_valid(next, r.id, r.role) : -1;
+            if (entry < 0) { ++a.not_in_ram; continue; }
+            if (vram.lookahead(next, r, entry, float(a.probability(i)), cache)) { ++a.queued; --budget; }
+        }
+    }
+    // The next layer's run: the time the link had, and which ranks it selected.
+    void lookahead_observe(int32_t layer, const int32_t * ids, int n) {
+        auto & a = lookahead;
+        if (a.layer != layer) { a.layer = -1; return; }
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - a.scheduled).count();
+        a.lead_us = a.lead_us > 0 ? 0.9 * a.lead_us + 0.1 * us : us;
+        for (int i = 0; i < a.n; ++i) {
+            if (!a.open[i]) { continue; }
+            a.seen[i] = 0.999 * a.seen[i] + 1.0;
+            a.selected[i] = 0.999 * a.selected[i] + double(std::find(ids, ids + n, a.hint[i]) != ids + n);
+        }
+        a.layer = -1;
+    }
+    void lookahead_report() {
+        const auto & a = lookahead;
+        if (!a.depth || !a.asked) { return; }
+        std::fprintf(stderr, "[kimi_vram_lookahead] depth=%d asked=%llu queued=%llu out_of_time=%llu not_in_ram=%llu lead_us=%.1f probability=",
+            a.depth, (unsigned long long) a.asked, (unsigned long long) a.queued, (unsigned long long) a.out_of_time,
+            (unsigned long long) a.not_in_ram, a.lead_us);
+        for (int i = 0; i < a.depth && i < 64; ++i) { std::fprintf(stderr, "%s%.3f", i ? "," : "", a.probability(i)); }
+        std::fprintf(stderr, "\n");
+    }
+
     void prefetch_schedule(const ggml_tensor * up, bool demand_reads) {
         int layer = -1, consumed = 0;
         const int nhint = prefetch.hint_n;
@@ -1200,6 +1505,7 @@ struct kimi_cpu_sink {
         prefetch.width = std::max(prefetch.width, nhint);
         prefetch.last_layer = layer + 1;
         prefetch.last_n = nhint;
+        lookahead_schedule(layer + 1, nhint, held);
         // without reads of its own, this run leaves the drive idle now
         if (policy.open_gate) { prefetch_open_gate(); }
         const int k = policy.ranks;
@@ -1262,6 +1568,9 @@ struct kimi_cpu_sink {
         host_lock_stop(); // the tier and the arena are both still here
         place_report("destroy");
         prefetch_report("destroy");
+        prediction_finish();
+        lookahead_report();
+        drop_report();
         {
             const auto l = cache.ledger.state();
             std::fprintf(stderr, "[kimi_host_ledger] reason=destroy unified=%d reserve=%llu margin=%llu floor=%llu file_reserve=%llu explicit_reserve=%llu granted=%llu refused=%llu cache_cgroup_rejections=%llu cache_system_rejections=%llu margin_updates=%llu\n",
@@ -2856,6 +3165,7 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
             throw std::runtime_error("invalid CPU expert stream arguments");
         }
         if (sink->poisoned) { throw std::runtime_error("CPU sink ring is poisoned after an I/O failure"); }
+        sink->prediction_prompt(up, down, ids, nexperts, *batch);
         sink->post_exp_norm = batch->activation.post_exp_norm;
         sink->activation_kind = batch->activation.kind;
         sink->beta = batch->activation.situ_beta;
@@ -3294,6 +3604,13 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     p.cache_allocation = "uniform";
     p.cache_keep = p.cache_prefill_read = p.cache_partial_reclaim = p.cache_reclaimable_file = true;
     p.cache_reserve_bytes = 512ull << 20;
+    p.trace_capacity = size_t(integer("trace.capacity"));
+    p.trace_prior = integer("trace.prior") != 0;
+    p.vram_lookahead = int(integer("vram.lookahead"));
+    p.drop_mass = int(integer("decode.drop_mass"));
+    const auto * trace_file = out.settings.paths("trace.file");
+    if (!trace_file || trace_file->size() > 1) { throw std::runtime_error("trace.file takes at most one path"); }
+    if (!trace_file->empty()) { p.trace_file = trace_file->front(); }
     return out;
 }
 }  // namespace
@@ -3366,11 +3683,29 @@ extern "C" bool kimi_cpu_sink_cache_configure(struct kimi_cpu_sink * sink, uint6
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
 
+extern "C" bool kimi_cpu_sink_expert_formats(struct kimi_cpu_sink * sink, const struct kimi_vram_layer_format * formats,
+        int count, char * error, size_t error_size) {
+    sink_error(error, error_size, "");
+    if (!sink || (count && !formats) || count < 0) { sink_error(error, error_size, "null CPU sink or expert formats"); return false; }
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    if (count && size_t(count) != sink->cache.layers.size()) { sink_error(error, error_size, "expert formats do not match the routed layers"); return false; }
+    for (int i = 0; i < count; ++i) {
+        const auto & layers = sink->cache.layers;
+        if (std::none_of(layers.begin(), layers.end(), [&](const auto & l) { return l.id == formats[i].layer; })) {
+            sink_error(error, error_size, "expert format of a layer that is not routed");
+            return false;
+        }
+    }
+    sink->vram.layer_formats.assign(formats, formats + count);
+    return true;
+}
+
 extern "C" bool kimi_cpu_sink_cache_begin(struct kimi_cpu_sink * sink, uint64_t epoch,
         uint64_t token, bool decode, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    if (!decode) { sink->prediction_boundary(); }
     try {
         sink->end_margin_interval(decode, epoch, token);
         sink->refresh_floor(decode ? "decode" : "prefill");
@@ -3434,6 +3769,9 @@ extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_
     if (!sink) { return; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     *stats = sink->cache.stats;
+    stats->prior_layers = sink->prediction.taken;
+    stats->lookahead_uploads = sink->lookahead.queued;
+    stats->warm_hits = sink->vram.warm_hits;
 }
 
 // The unconfigured C compatibility API has no L3 registration to borrow.
@@ -3547,6 +3885,9 @@ extern "C" bool kimi_cpu_sink_run_activation(
                     !up->name[consumed]) {
                 sink->prefetch_drain(layer, ids, nslots);
                 sink->mrc.observe(layer, ids, nslots);
+                sink->prediction_decode(up, down, layer, ids, nslots);
+                sink->lookahead_observe(layer, ids, nslots);
+                if (sink->plan_drop(layer, ids, weights, nslots)) { ids = sink->drop.ids.data(); weights = sink->drop.weights.data(); }
             } else {
                 sink->prefetch_drain();
             }

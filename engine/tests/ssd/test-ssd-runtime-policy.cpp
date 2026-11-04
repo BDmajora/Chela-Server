@@ -112,7 +112,23 @@ static void calibration_contract() {
     fit = observe_prefill_lines(s,cost,prior,f);
     check(fit.gpu_lane_us == 10 && fit.gpu_overhead_us == 0, "CPU-only sample cannot train GPU overhead from worker bookkeeping");
 }
+static void drop_contract() {
+    const int32_t ids[6] = { 5, 1, 7, -1, 6, 3 };
+    const float weights[6] = { .4f, .3f, .1f, .9f, .1f, .1f };
+    const uint8_t none[6] = {}, held[6] = { 0, 0, 1, 0, 0, 1 };
+    std::vector<uint8_t> drop;
+    check(plan_expert_drop(ids, weights, none, 6, 0.0, drop) == 1.0 && drop == std::vector<uint8_t>(6, 0), "no budget drops nothing");
+    const double scale = plan_expert_drop(ids, weights, none, 6, 0.21, drop);
+    check(drop == std::vector<uint8_t>({ 0, 0, 1, 0, 1, 0 }), "the lowest weights go first, within the budget, a skipped slot not counted");
+    const double total = double(.4f) + double(.3f) + 3 * double(.1f);
+    check(near(scale, total / (total - 2 * double(.1f))), "the kept weights scale back to the total");
+    plan_expert_drop(ids, weights, held, 6, 0.5, drop);
+    check(drop == std::vector<uint8_t>({ 0, 0, 0, 0, 1, 0 }) || drop == std::vector<uint8_t>({ 0, 1, 0, 0, 1, 0 }), "a held expert never goes");
+    check(!drop[0], "the strongest pick stays while half must");
+    plan_expert_drop(ids, weights, none, 6, 0.5, drop);
+    check(std::count(drop.begin(), drop.end(), 1) == 2, "at least half of the five live picks stay (three)");
+}
 int main() {
-    learning_contract(); prefetch_contract(); placement_contract(); calibration_contract();
+    learning_contract(); prefetch_contract(); placement_contract(); calibration_contract(); drop_contract();
     std::puts("RUNTIME_POLICY_PASS learning placement prefetch calibration");
 }

@@ -331,6 +331,11 @@ const std::vector<std::string> * snapshot::sources() const noexcept {
     return v ? std::get_if<std::vector<std::string>>(&v->data) : nullptr;
 }
 
+const std::vector<std::string> * snapshot::paths(const std::string & key) const noexcept {
+    const auto * v = find(key);
+    return v ? std::get_if<std::vector<std::string>>(&v->data) : nullptr;
+}
+
 const std::vector<uint32_t> * snapshot::cpus(const std::string & key) const noexcept {
     const auto * v = find(key);
     return v ? std::get_if<std::vector<uint32_t>>(&v->data) : nullptr;

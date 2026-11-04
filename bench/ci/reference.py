@@ -17,7 +17,9 @@ LEGACY_REVISION = "f5e6e26ff26d2014cccef0118048039b88163f54"
 SETTING_KEYS = frozenset((
     "expert.source", "cpu.io_cpus", "cpu.decode_participants", "prefetch.depth",
     "place.costs", "prefill.cpu_max_tokens", "vram.budget", "vram.max_slots",
-    "vram.reserve_mib", "host.headroom_mib", "host.budget_mib",
+    "vram.reserve_mib", "vram.lookahead", "vram.warm_mib", "vram.warm_bits",
+    "host.headroom_mib", "host.budget_mib", "decode.drop_mass",
+    "trace.capacity", "trace.prior", "trace.file",
     "model.engram_prefetch", "model.hc_fused",
 ))
 SETTING_GENERATIONS = (SETTING_KEYS,)

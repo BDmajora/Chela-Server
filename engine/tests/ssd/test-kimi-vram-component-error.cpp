@@ -2,7 +2,7 @@
 #include "ggml.h"
 #include "ggml-kimi-mxfp4-parity.h"
 #include "ggml-kimi-mxfp4-chain.h"
-#include <cuda_runtime_api.h>
+#include "gpu-runtime.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -77,7 +77,8 @@ int main(int argc, char ** argv) { try {
     proxy_base.submit = submit; proxy_base.wait = wait; proxy_base.error = error; proxy_base.destroy = destroy;
     proxy_chain.submit = chain_submit; proxy_chain.destroy = chain_destroy;
     const auto * api = kimi_vram_format_compute_get_api();
-    require(api && api->version == 2 && api->size == sizeof(*api), "compute ABI");
+    require(api && api->version == 4 && api->size == sizeof(*api), "compute ABI");
+    require(!api->warm_configure && !api->warm_demote && !api->warm_drain, "MXFP4 offered a warm pool");
     constexpr int latent = 256, hidden = 256;
     const size_t role = ggml_row_size(GGML_TYPE_MXFP4, latent) * hidden;
     device_payload weights;

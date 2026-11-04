@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "staging.h"
 #include "ggml-cuda.h"
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 #include <cstdio>
 #include <cstdlib>
 namespace ggml_moe_common {

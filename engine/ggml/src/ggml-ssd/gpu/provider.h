@@ -30,6 +30,7 @@ struct provider_v1 {
     int (*device_ordinal)(ggml_backend_t);
     bool (*attach_services)(ggml_backend_t, const runtime_services *, char *, size_t) noexcept;
     void * (*stream)(ggml_backend_t);
+    const kimi_vram_prior_api * prior; // optional: null leaves the tier's counts to its own history
 };
 using get_provider_v1 = const provider_v1 * (*)();
 }} // namespace ssd::gpu

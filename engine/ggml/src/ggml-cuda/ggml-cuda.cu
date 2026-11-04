@@ -316,6 +316,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
     GGML_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices (Total VRAM: %zu MiB):\n",
                   __func__, info.device_count, (size_t)(total_vram / (1024 * 1024)));
     total_vram = 0;
+#if defined(GGML_USE_HIP) && !defined(__OPTIMIZE__)
+    // Unoptimized device code runs about 100 times slower; see the -O guard in ggml-hip/CMakeLists.txt.
+    GGML_LOG_WARN("%s: the " GGML_CUDA_NAME " kernels were built without optimization; rebuild with -O3\n", __func__);
+#endif // defined(GGML_USE_HIP) && !defined(__OPTIMIZE__)
 
     std::vector<std::pair<int, std::string>> turing_devices_without_mma;
     for (int id = 0; id < info.device_count; ++id) {
@@ -6224,6 +6228,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -6262,6 +6267,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

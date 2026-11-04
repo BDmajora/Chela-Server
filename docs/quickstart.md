@@ -135,6 +135,44 @@ python3 scripts/engine-resources.py \
 
 The [Linux resource prerequisites](testing.md#linux-resource-prerequisites) describe I/O, cgroup and pinned-memory requirements.
 
+## Linux / AMD ROCm
+
+The server, the CPU sink and the GPU expert tier also build through ROCm's HIP. The `inferssd` launcher reads NVIDIA devices only, so start the server directly or from your own service. Its numerical tests run on NVIDIA through the same sources, and it has run on one AMD card, an RX 6800 (gfx1030), where `--fit on` beat the sink on a 58 GB model: 15 tok/s decode against 10 in one benchmark client, and a first token in 12 s against 58 on a 4,180-token prompt.
+
+```sh
+./build.sh
+```
+
+The script checks the prerequisites and prints an install command for anything missing, finds your GPU, builds `build-linux-rocm/bin/inferssd-server`, and confirms that the server can see the GPU. `./build.sh --check` stops before building, and `./build.sh --help` lists the options, including `--gpu` to build for another GPU and `--clean` to start again.
+
+To build by hand, set `GPU_TARGETS` to your GPU; `rocminfo | grep gfx` names it:
+
+```sh
+cmake --preset linux-rocm -DGPU_TARGETS=gfx1030
+cmake --build build-linux-rocm --parallel 4 --target inferssd-server
+```
+
+Then compare the two offload routes on your own model before choosing one. `--fit on` lets the scheduler keep what fits, and an expert source sends routed experts through the sink:
+
+```sh
+build-linux-rocm/bin/inferssd-server -m MODEL.gguf --fit on
+```
+
+The sink reads experts through an alias index, a table of their file ranges that copies no weights, so build that first. It lands in `INDEX_DIR/experts.tsv`:
+
+```sh
+inferssd source index MODEL.gguf INDEX_DIR
+```
+
+```sh
+systemd-run --user --scope -p MemoryMax=56G -p MemorySwapMax=0 \
+  build-linux-rocm/bin/inferssd-server -m MODEL.gguf --gpu-layers 99 --fit off --mmap --no-repack --defer-experts \
+  --ssd-expert-source '["INDEX_DIR/experts.tsv"]' --ssd-vram-budget auto --ssd-vram-reserve-mib 1024 \
+  --ssd-trace-file '["TRACE.bin"]'
+```
+
+Set `MemoryMax` below your RAM: the RAM cache needs a finite cgroup. `--defer-experts` leaves the mapped experts unread, since the sink reads them itself. Keep the reserve: the tier grows until only it is left, and a long prompt's GPU scratch comes out of it, so with none a large prompt can run the card out of memory. A path setting takes a JSON list, and any setting in [configuration](configuration.md) has a flag of the same name, so `vram.lookahead` is `--ssd-vram-lookahead`. The sink's lines in the server log tell you what happened: `[kimi_expert_trace]` for the prediction, `[kimi_vram_admission]` for the tier's hits and prices, and `[kimi_vram_lookahead]` and `[kimi_expert_drop]` when those are on.
+
 ### Linux requirements
 
 `inferssd launch` runs the server in a systemd scope whose memory limit is the policy's `memory_budget_bytes` and which forbids the server to swap; other programs may still use swap. This needs:

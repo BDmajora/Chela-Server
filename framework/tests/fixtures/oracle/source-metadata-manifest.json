@@ -4,7 +4,7 @@
     {
       "path": "tools/adaptive/gguf_header.py",
       "file": "gguf_header_reference.py",
-      "sha256": "2d802d523d4f64dfde445414a0c5a3b3a12b4b4e7226865d37834ae78418b569",
+      "sha256": "2a23afb79129d080c46be2400c9b316b06d8d02298f1b0795d9fd1dbb37e4dab",
       "git_blob": "6b85db8b642c1839a164ed240d6b72ca1cade6e0"
     },
     {

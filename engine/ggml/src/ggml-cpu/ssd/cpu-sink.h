@@ -78,6 +78,15 @@ GGML_BACKEND_API bool kimi_cpu_sink_cache_configure(
         const int32_t * layer_priority, int n_layers, int max_experts_per_layer,
         char * error, size_t error_size);
 
+// After configure, and before the first run: the types and expert bytes of every
+// routed layer (cache_configure's layers), which the GPU tier sizes its slots and
+// its engines' kernels by. Without it the tier takes every layer's format from
+// the first layer it sees.
+struct kimi_vram_layer_format;
+GGML_BACKEND_API bool kimi_cpu_sink_expert_formats(
+        struct kimi_cpu_sink * sink, const struct kimi_vram_layer_format * formats, int count,
+        char * error, size_t error_size);
+
 // Call once before each logical token, and with decode=false before prefill or
 // an unsupported batch. False disables cache use and by default unmaps pages;
 // optional retention keeps weights only while headroom permits. A changed epoch

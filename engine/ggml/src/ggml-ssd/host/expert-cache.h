@@ -1033,6 +1033,46 @@ struct expert_cache {
         }
         return false;
     }
+    // A request's predicted selections per decode token (ssd::place::expert_predictor): count_decay2 starts the layer
+    // from the counts those rates would have left, for the experts predicted above the layer's mean, instead of the
+    // previous request's heat, which the prediction already weighs. It orders only evictions, and its half-life of two
+    // tokens hands over to the request's own selections within a few tokens. Skipped when the ledger has no room for
+    // the map's nodes. Between layers, as a layer's prepare updates the same counts.
+    void set_prior(int32_t layer_id, const float * rates, size_t n) {
+        if (policy != count_decay2 || !rates || !n) { return; }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return; }
+        double total = 0;
+        for (size_t e = 0; e < n; ++e) { total += rates[e]; }
+        const double mean = total / double(n), memory = 1.0 / (1.0 - std::exp2(-0.5));
+        size_t nodes = 0;
+        for (size_t e = 0; e < n; ++e) { nodes += rates[e] > mean; }
+        auto ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))));
+        if (!ticket) { return; }
+        try {
+            found->count_frequency.clear();
+            for (size_t e = 0; e < n; ++e) {
+                if (rates[e] > mean) { found->count_frequency[int32_t(e)] = double(rates[e]) * memory; }
+            }
+        } catch (const std::bad_alloc &) { found->count_frequency.clear(); return; }
+        found->count_step = age_steps;
+        ticket.value.commit();
+    }
+    // The slot that holds the expert's whole payload now, or -1: nothing still being read, and no other source.
+    int find_valid(int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles) const {
+        if (!active || !arena) { return -1; }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return -1; }
+        const size_t layer_index = size_t(found - layers.begin());
+        source_key keys[3];
+        for (int role = 0; role < 3; ++role) { keys[role] = key(roles[role]); }
+        for (size_t i = found->begin; i < found->begin + found->count; ++i) {
+            const auto & e = entries[i];
+            if (e.enabled && e.valid && !e.inflight && !e.reserved && e.resident && e.layer_index == layer_index && e.id == expert &&
+                    e.source[0] == keys[0] && e.source[1] == keys[1] && e.source[2] == keys[2]) { return int(i); }
+        }
+        return -1;
+    }
     // Next-layer prefetch: take a resident, idle slot of the layer (a free one first, else the coldest) for an
     // expert that is not cached. The slot is inflight, invisible to lookups and allocation, until prefetch_done
     // publishes it (or prefetch_activate publishes it early as a hit that its run waits for).
@@ -1170,17 +1210,23 @@ struct expert_cache {
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end()) { return 0; }
         const size_t layer_index = size_t(found - layers.begin());
+        // A copy costs nothing while the layer's slots have room, and spares a drive read when the GPU tier evicts the
+        // expert: only a layer with no free slot gives it up. Dropped eagerly on Qwen3.8 (25 GB of experts, 60 GB of RAM,
+        // a 12 GB tier), a 33 GB cache held 0.9 GB and every tier eviction went back to a SATA drive at 6.5 ms an expert.
+        entry * copy = nullptr;
+        bool room = false;
         for (size_t i = found->begin; i < found->begin + found->count; ++i) {
             auto & e = entries[i];
-            if (!e.valid || e.id != request.id || e.layer_index != layer_index || !matches(e, request)) { continue; }
-            if (e.leases || e.protected_now || e.reserved || e.inflight) { return -1; }
-            e.valid = false;
-            stats.valid_bytes -= stride;
-            // Keep resident and committed/page-table accounting: the physical
-            // slot is reused in place, without a second payload allocation.
-            return 1;
+            room = room || (e.enabled && !e.valid && !e.reserved && !e.inflight);
+            if (e.valid && e.id == request.id && e.layer_index == layer_index && matches(e, request)) { copy = &e; }
         }
-        return 0;
+        if (!copy || room) { return 0; }
+        if (copy->leases || copy->protected_now || copy->reserved || copy->inflight) { return -1; }
+        copy->valid = false;
+        stats.valid_bytes -= stride;
+        // Keep resident and committed/page-table accounting: the physical
+        // slot is reused in place, without a second payload allocation.
+        return 1;
     }
 };
 

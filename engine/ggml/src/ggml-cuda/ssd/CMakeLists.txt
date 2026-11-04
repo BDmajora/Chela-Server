@@ -1,5 +1,32 @@
 find_package(Threads REQUIRED)
 
+if (GGML_HIP)
+    # The same tier through ggml's CUDA-to-HIP names (vendors/hip.h), linked into ggml-hip. Every source is HIP
+    # language, the C++ ones too: the vendor header needs the HIP compiler. The strict parity target keeps the
+    # contract of --fmad=false --ftz=false: no contraction into fused multiply-adds, denormals kept.
+    set(SSD_PARITY_SOURCES kimi-mxfp4-chain.cu kimi-mxfp4-batch.cu)
+    set(SSD_TIER_SOURCES vram-tier.cpp mxfp4-compute-adapter.cpp
+        generic-compute-adapter.cu group-compute-adapter.cu provider.cpp transport.cpp)
+    set_source_files_properties(${SSD_PARITY_SOURCES} ${SSD_TIER_SOURCES} PROPERTIES LANGUAGE HIP)
+    add_library(kimi-mxfp4-parity OBJECT ${SSD_PARITY_SOURCES})
+    set_target_properties(kimi-mxfp4-parity PROPERTIES
+        POSITION_INDEPENDENT_CODE ON HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON)
+    target_include_directories(kimi-mxfp4-parity PRIVATE ../../../include ../..)
+    target_compile_options(kimi-mxfp4-parity PRIVATE
+        -O3 -fno-fast-math -ffp-contract=off -fno-gpu-flush-denormals-to-zero -Wall -Wextra)
+    target_link_libraries(kimi-mxfp4-parity PRIVATE hip::host)
+
+    add_library(kimi-vram-tier OBJECT ${SSD_TIER_SOURCES})
+    set_target_properties(kimi-vram-tier PROPERTIES POSITION_INDEPENDENT_CODE ON
+        HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON)
+    target_include_directories(kimi-vram-tier PRIVATE ../../../include ../..)
+    target_compile_options(kimi-vram-tier PRIVATE -fno-fast-math -ffp-contract=off)
+    target_link_libraries(kimi-vram-tier PRIVATE ggml-base ggml-ssd ggml-ssd-object-io hip::host Threads::Threads)
+    target_link_libraries(ggml-hip PRIVATE kimi-vram-tier kimi-mxfp4-parity ggml-ssd ggml-ssd-object-io)
+    target_compile_definitions(ggml-hip PRIVATE GGML_SSD_CUDA_EXECUTOR)
+    return()
+endif()
+
 # Separate object targets keep the strict parity compiler contract independent
 # of ggml-cuda's -use_fast_math. Both are normally linked into that backend.
 add_library(kimi-mxfp4-parity OBJECT kimi-mxfp4-chain.cu kimi-mxfp4-batch.cu)

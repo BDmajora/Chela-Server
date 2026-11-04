@@ -15,9 +15,16 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 | `prefill.cpu_max_tokens` | integer / tokens | `4294967295` | plan | linux |
 | `vram.budget` | budget / bytes | `auto` | plan | linux |
 | `vram.max_slots` | integer / slots | `0` | plan | linux |
+| `vram.lookahead` | integer / predicted experts | `0` | plan | linux |
+| `vram.warm_mib` | integer / MiB | `0` | plan | linux |
+| `vram.warm_bits` | integer / bits | `4` | plan | linux |
 | `vram.reserve_mib` | integer / MiB | `0` | launch | linux |
 | `host.headroom_mib` | integer / MiB | `512` | plan | all |
 | `host.budget_mib` | integer / MiB | `0` | plan | darwin, windows |
+| `decode.drop_mass` | integer / percent of routing weight | `0` | plan | all |
+| `trace.capacity` | integer / requests | `32` | plan | all |
+| `trace.prior` | integer / boolean | `1` | plan | all |
+| `trace.file` | paths / path | `[]` | plan | all |
 | `model.engram_prefetch` | integer / boolean | `0` | model | all |
 | `model.hc_fused` | integer / boolean | `1` | model | all |
 
@@ -31,16 +38,16 @@ own I/O, prefetch and watch threads, and macOS, which cannot pin threads, only
 validates it. Zero decode participants leaves the measured/default policy; a
 positive value counts the leading ggml threads of each decode phase, and a
 decode call with fewer threads fails. Non-applicable platform keys cannot be
-explicitly set. The `vram.*` keys size the CUDA expert tier. `vram.budget = auto`
+explicitly set. The `vram.*` keys size the GPU expert tier (CUDA, or HIP with the `linux-rocm` preset). `vram.budget = auto`
 gives the tier all the room
 the GPU admits; on a GPU that shares the host's memory, such as GB10, that is
 the host memory envelope below less the slots the next-layer prefetch lands in,
 which are all the RAM cache keeps beside a tier there (with `vram.budget = 0`
-the RAM cache takes the envelope). Auto gives no tier where no CUDA backend
-runs: on macOS and Windows, on a CPU-only build, or with only Metal or another
-GPU backend, which then runs the dense layers while the CPU sink computes every
-routed expert. An
-explicit nonzero budget without a CUDA backend is an error. On macOS the
+the RAM cache takes the envelope). Auto gives no tier where no CUDA or HIP
+backend built with the tier runs: on macOS and Windows, on a CPU-only build, or
+with only Metal or another GPU backend, which then runs the dense layers while
+the CPU sink computes every routed expert. An
+explicit nonzero budget without such a backend is an error. On macOS the
 interface supports static settings only; it does not include an online adaptive
 controller.
 
@@ -75,6 +82,47 @@ scratch buffer or a server checkpoint, first takes room back from the expert
 caches: on unified memory from the GPU tier, whose blocks also answer any CUDA
 allocation that would fail while no layer holds them, then from the RAM
 cache's coldest slots.
+
+## Expert prediction
+
+The `trace.*` keys configure the executor's request-level expert predictor (`ggml-ssd/place/expert-trace.h`,
+described in [how it works](architecture.md#expert-prediction)). It predicts, when a request's decode starts, which
+experts its decode tokens will select, as a rate per token for every routed expert. `trace.capacity` is how many
+earlier requests it keeps traced (their prompts' and their decodes' expert activation matrices) to match a new
+prompt against; zero keeps prediction to the request's own prompt, the previous request and the long-run usage
+profile. With `trace.prior = 1` the GPU expert tier starts each request's decode from the predicted rates instead of
+the previous request's selection counts; it changes which experts the tier holds, never a result. `trace.file`
+names at most one file that keeps the traces and the profile across runs, for the same expert geometry and types
+only; another model's file is left alone and replaced at the next write. The file is written at request
+boundaries (at most every 30 seconds) and when the context closes, through a temporary file renamed over it.
+
+`vram.lookahead` sends up to that many of the next layer's router-predicted experts from RAM to the GPU tier ahead of
+their selection, while the layer before runs. It is off by default because each one spends link time: a positive value
+needs a measurement on the machine (`[kimi_vram_lookahead]` reports the experts asked, sent and used). The tier takes
+one only on its usual cost rule, with its expected hits weighed by how often that rank of the hint is selected, and the
+sink sends only as many as their measured uploads fit in the measured time to the next layer's prepare, which waits
+for them.
+
+## Approximate decode
+
+Two settings trade a little fidelity for time. Both are off by default and both change results, so that a run with
+either is no longer comparable bit for bit, and each must be judged by what it does to the model's output on the
+machine that uses it.
+
+`decode.drop_mass` skips, per decode token and layer, routed experts that are in neither the GPU tier nor the RAM cache
+while the routing weight they carry stays below that percentage of the layer's selections; the weights of the kept
+experts are scaled back to the original sum. The expert a token weighs most is never dropped. `[kimi_expert_drop]`
+reports the experts and the weight dropped. Prefill always computes every route.
+
+`vram.warm_mib` gives the GPU tier that much device memory, out of what its slots would have taken, for low-precision
+copies of the experts it evicts. The device requantizes a victim into `vram.warm_bits`-bit form (4 for Q4_0, 2 for
+Q2_0; other values are refused) in place, without a byte over the link, and a later selection the tier does not admit
+is computed from the copy instead of on the CPU. An admission promotes the expert: its upload proceeds as usual, and
+it is exact again. Only the generic engine has copies, and only for a format at least a quarter larger than its copy,
+so the pool stays off, with a `[kimi_vram_warm] status=off` line, for MXFP4 and for a format as small as IQ1_M.
+`[kimi_vram_warm]` reports the copies made and the requests they served. In the synthetic replay
+(`test-kimi-vram-prior-replay`) the same bytes served more requests as ordinary slots, so give the pool memory only
+where a measurement on the real model and link says it pays.
 
 ## File and CLI contract
 

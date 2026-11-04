@@ -32,6 +32,13 @@ struct execution_policy {
     bool vram_locations = false;
     ssd::gpu::testing::tier_options tier;
     std::map<std::string, double> place_costs;
+    // Request-level expert prediction (ssd::place::expert_predictor): the requests it traces, whether the expert caches
+    // start each request's decode from its prediction, and the file that keeps it across runs. Off unless one is set.
+    size_t trace_capacity = 0;
+    bool trace_prior = false;
+    std::string trace_file;
+    int vram_lookahead = 0; // the next layer's predicted experts that go to the GPU tier ahead of their selection
+    int drop_mass = 0;      // routing weight, percent, decode may drop among experts no cache holds (decode.drop_mass)
 };
 
 // Test callers own explicit policy inputs until this call returns; the executor

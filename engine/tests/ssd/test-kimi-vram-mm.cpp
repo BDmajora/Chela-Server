@@ -19,7 +19,7 @@
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 
 #include <algorithm>
 #include <cmath>

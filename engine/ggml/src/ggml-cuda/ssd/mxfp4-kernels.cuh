@@ -3,9 +3,13 @@
 // outside the backend CUDA flags with --fmad=false --ftz=false
 // (build_mxfp4_component.sh). Every floating-point operation is explicit.
 #include "ggml-kimi-mxfp4-parity.h"
+#if defined(GGML_USE_HIP)
+#define GGML_COMMON_DECL_HIP
+#else
 #define GGML_COMMON_DECL_CUDA
+#endif
 #include "ggml-common.h"
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 #include <atomic>
 #include <algorithm>
 #include <chrono>

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **AMD GPUs:** the GPU expert tier now builds through ROCm's HIP (`linux-rocm` preset), alongside the CPU sink. It has run on an RX 6800 (gfx1030), and there `--fit on` was faster than the sink. The launcher still reads NVIDIA devices only.
+- **ROCm build script:** `./build.sh` checks the prerequisites, detects the GPU, builds the server and confirms that it can see the GPU.
+- **Q2_0 weights:** quantization, CPU kernels and GPU kernels for the 2-bit format.
+- **Request-level expert prediction:** each request's decode starts from a prediction of its experts, made from its prompt, from traced earlier requests, from the previous request and from a usage profile that `trace.file` keeps across runs. The GPU tier and the RAM cache take it as a prior. It changes what is cached, not results.
+- **Router lookahead for the GPU tier:** `vram.lookahead` sends the next layer's predicted experts up ahead of their selection. Off by default.
+- **Qwen 3.8 router lookahead:** `qwen4exp` models now give the sink a hint for the next layer.
+- **Layer ordering:** grouped prefill's GPU lane runs in Johnson's order where the pipeline model ends sooner.
+- **Mixed expert formats:** the GPU tier now runs models whose layers use different expert types, in decode and in grouped prefill, with blocks of slots in each expert size.
+- **Approximate decode, off by default:** `decode.drop_mass` skips cold experts of little routing weight, and `vram.warm_mib` keeps low-precision copies of evicted experts on the GPU. Both change results.
+
+### Fixes
+
+- **RAM copies of GPU experts:** the RAM cache gave up its copy of every expert that went up to the GPU tier, even with slots free, so each eviction from the tier read that expert from the drive again. It now keeps the copy while the layer has a free slot.
+
 ## 0.1.1 - 2026-10-31
 
 This release fixes the Linux source install with recent CUDA toolkits.

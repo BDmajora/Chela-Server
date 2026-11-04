@@ -146,6 +146,21 @@
             "GGML_CUDA_KIMI_VRAM_TIER": "ON",
             "LLAMA_SSD_STORE": "ON"
         }
+    },
+    {
+        "name": "linux-rocm",
+        "inherits": [
+            "base",
+            "release"
+        ],
+        "cacheVariables": {
+            "GGML_OPENMP": "OFF",
+            "LLAMA_BUILD_SERVER": "ON",
+            "LLAMA_BUILD_TESTS": "ON",
+            "GGML_HIP": "ON",
+            "GGML_CUDA_KIMI_VRAM_TIER": "ON",
+            "LLAMA_SSD_STORE": "ON"
+        }
     }
   ]
 }

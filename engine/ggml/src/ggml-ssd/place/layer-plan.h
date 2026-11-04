@@ -131,6 +131,28 @@ inline double kimi_place_pipeline(const double * c, const double * d, size_t n, 
     return n ? computed[n - 1] : 0.0;
 }
 
+// The GPU lane's run order of moves (expert-level scheduling, ES-MoE, PMLR 235): Johnson's rule for the two-stage flow
+// shop of their copies (d) and computations (c): the moves whose copy is no longer than their computation first, by
+// increasing copy, then the others by decreasing computation. With unlimited buffers it gives the least makespan; the
+// tier has `slots` device slots, so the order is kept only where the pipeline over them (kimi_place_pipeline) ends no
+// later than in the given order. With one expert size every copy is equal and Johnson's order is the order by routes
+// that the moves are chosen in; it differs where copies differ (in place or page-locked against pageable sources).
+inline void kimi_place_johnson(std::vector<size_t> & order, const double * copy, const double * compute, size_t slots = 2) {
+    if (order.size() < 2) { return; }
+    std::vector<size_t> johnson = order;
+    std::stable_sort(johnson.begin(), johnson.end(), [&](size_t a, size_t b) {
+        const bool first_a = copy[a] <= compute[a], first_b = copy[b] <= compute[b];
+        if (first_a != first_b) { return first_a; }
+        return first_a ? copy[a] < copy[b] : compute[a] > compute[b];
+    });
+    auto end = [&](const std::vector<size_t> & o) {
+        std::vector<double> c(o.size()), d(o.size());
+        for (size_t j = 0; j < o.size(); ++j) { c[j] = compute[o[j]]; d[j] = copy[o[j]]; }
+        return kimi_place_pipeline(c.data(), d.data(), o.size(), slots);
+    };
+    if (end(johnson) < end(order)) { order.swap(johnson); }
+}
+
 // How many of the moves, taken in their order, to make: the fewest whose predicted time is within `fill` of the lowest
 // (the time model's resolution). time(k) is the predicted layer time with the first k moves made, for k = 0..count.
 // *chosen receives the chosen time.
@@ -571,6 +593,13 @@ inline kimi_place_result kimi_place_layer(const kimi_place_table & t, int ntoken
         out.overhead = k || l.gpu_work ? l.gpu_overhead : 0.0;
     }
     out.moved.assign(order.begin(), order.begin() + k);
+    // the streamed form's GPU pipeline runs the chosen moves in Johnson's order where that ends sooner (the list
+    // schedule's GPU lane already takes moves as their bytes land)
+    if (!out.ring && out.moved.size() > 1) {
+        std::vector<double> d(n, 0.0), c(n, 0.0);
+        for (size_t i : out.moved) { d[i] = copied(items[i]); c[i] = compute(items[i]); }
+        kimi_place_johnson(out.moved, d.data(), c.data());
+    }
     // each lane's predicted start of its experts: the GPU's moves in their order, a copy on the link before its
     // computation (the pipeline), the CPU's experts in item order
     double link = t.link_busy_us, gpu = 0.0, cpu = 0.0;

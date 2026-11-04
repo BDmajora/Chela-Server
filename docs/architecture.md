@@ -22,7 +22,29 @@ flowchart LR
 
 Source indexes locate expert byte ranges in the original GGUF files or a matching v1 expert pack. Indexing GGUF headers does not copy the model payload. Packs group expert slices by layer and expert with **4 KiB alignment**, preserving the existing quantized bytes. The v1 format has no checkpoint fingerprint, so keep each pack paired with its source checkpoint.
 
-The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux, macOS and Windows run configured experts on the same CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows, persistent reader threads with `F_NOCACHE` on macOS) into its RAM cache; with CUDA, Linux adds the GPU cache tier. A GPU backend without that tier, such as Metal, runs the dense layers, and the sink computes every routed expert on the CPU. Device and source validation remains necessary for the selected configuration.
+The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux, macOS and Windows run configured experts on the same CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows, persistent reader threads with `F_NOCACHE` on macOS) into its RAM cache; with CUDA, or with HIP on AMD GPUs (the `linux-rocm` preset builds the same tier sources through ggml's CUDA-to-HIP names), Linux adds the GPU cache tier. A GPU backend without that tier, such as Metal, runs the dense layers, and the sink computes every routed expert on the CPU. Device and source validation remains necessary for the selected configuration.
+
+## Expert prediction
+
+Each context's sink keeps a request-level expert predictor (`ggml-ssd/place/expert-trace.h`, typed `trace.*` settings). It sees the routes of every prompt through grouped prefill and the selections of every decode token, and when a request's decode starts it predicts the rate at which each routed expert of each layer will be selected per token. Five sources are mixed:
+
+| Source | What it predicts from | After |
+| --- | --- | --- |
+| prompt | the experts the request's own prefill routed: decode keeps to the domain of its prompt | DoMoE (IJCAI 2026), prefill-stage domain prediction |
+| traced | the decodes of earlier requests whose prompts routed alike: expert activation matrices kept in a bounded collection, matched by mean per-layer cosine similarity, the least matched replaced first | MoE-Infinity (arXiv:2401.14361), request-level activation tracing |
+| last | the previous request's decode: consecutive turns of one conversation | |
+| profile | a decayed usage profile of every request, kept across runs in `trace.file` | moe-cache usage profiles (warm start) |
+| uniform | every expert alike, so that no rate is zero | |
+
+The mixture weights are fitted online to the selections decode makes (online EM for mixture weights); a source with no data for a layer drops out of that layer's mixture. With `trace.prior` the GPU tier starts the request's decode from the predicted rates, turned into the decayed selection counts they would have left (`vram_slot_table::set_prior`), instead of the previous request's heat. Its admissions and evictions then price the experts the request is expected to use as if it had already used them, under the same cost rule as before, and the request's own selections take over within a few half-lives. A prior changes which experts the tier holds, never a result. The RAM cache takes the same prediction for the experts above each layer's mean rate. A replay of a synthetic multi-domain request stream through the slot table (`test-kimi-vram-prior-replay`) is the model-free check of the mechanism; gains on a real model are device measurements.
+
+Within a token, the next layer's router is known before the layer runs: its gate takes the current layer's output, and the sink reads ahead what the hint predicts. With `vram.lookahead` the highest-ranked of those experts also go from RAM to the GPU tier ahead of their selection, as far as the measured uploads fit in the measured time to the next layer (`vram_slot_table::reserve_lookahead`). The admission's expected hits are weighed by how often that rank of the hint proves right, measured per rank, so a poor hint admits nothing.
+
+Two optional mechanisms are approximate, and `decode.drop_mass` and `vram.warm_mib` keep them off by default. Expert drop skips, per token and layer, the cold experts of least routing weight, within a budget of that weight, and scales the rest back to the original sum (MoE-Infinity's measured tolerance of low-mass experts, moe-cache's expert skip). The warm pool (`vram-warm-pool.h`) follows DynaExq's hot-high, cold-low precision without its online retraining: when the slot table evicts an expert the device requantizes it in place to Q4_0 or Q2_0 and keeps serving it at that precision, the most recently evicted staying, until the ordinary admission rule promotes it. Each conversion's readers and the upload that overwrites its slot wait for it on an event, so nothing stalls the sink's thread.
+
+Grouped prefill moves to the GPU the experts whose computation saves the most CPU time, and its GPU lane runs them in Johnson's order for the two-stage flow shop of their copies and computations where the pipeline model ends sooner (ES-MoE's expert-level scheduling, PMLR 235). With one expert size every copy is equal and that is the order by routes in which they are chosen.
+
+The tier's upload streams and compute stream already overlap: a deferred upload runs on its own stream and thread while the layer computes, and a layer's next prepare waits only for what it needs (DeepSpeed-FastGen's overlapped streams and ZeRO-Inference's host offload, in the tier's own form).
 
 ## Threads
 
@@ -47,10 +69,10 @@ The runtime extends the bundled llama.cpp snapshot. Its integration points are l
 | Core | `engine/ggml/src/ggml-ssd/store` | Immutable per-context source indexes and explicit pack/alias parsing |
 | Core | `engine/ggml/src/ggml-ssd/io` | Independent syscall and liburing readers; portable pread |
 | Core | `engine/ggml/src/ggml-ssd/host` | Process host arbiter, per-context leases, expert cache and page accounting |
-| Core | `engine/ggml/src/ggml-ssd/place` | Shared placement cost evaluation, learning state and prefetch decisions |
+| Core | `engine/ggml/src/ggml-ssd/place` | Shared placement cost evaluation, learning state, prefetch decisions and request-level expert prediction |
 | Core | `engine/ggml/src/ggml-ssd/stream` | Expert ranges, dense lookahead, seed ordering and copy observations |
 | Core | `engine/ggml/src/ggml-ssd/settings`, `telemetry` | Immutable validated settings, source receipts and owned JSONL writers |
-| Executors | `engine/ggml/src/ggml-cpu/ssd`, `engine/ggml/src/ggml-cuda/ssd` | CPU scheduling and compute; CUDA tier, staging, events and format kernels |
+| Executors | `engine/ggml/src/ggml-cpu/ssd`, `engine/ggml/src/ggml-cuda/ssd` | CPU scheduling and compute; GPU tier (CUDA and HIP), staging, events and format kernels |
 | Runtime | `engine/src/ssd` | Context assembly, backend registry binding, model sources, model adaptation, graph admission and diagnostics |
 | llama extensions | `engine/src/inferssd` | KV state codecs and positional state serialization |
 | Common | `engine/common/inferssd` | CLI glue, model chat parsing, reasoning budgets |

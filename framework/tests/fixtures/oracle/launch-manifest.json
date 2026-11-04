@@ -9,7 +9,7 @@
     "tools/adaptive/models/dsv41.conf": "8cf4b95ffc172edfcc2c35cf1c6e7430a1d5116dccfdd9d81b5db6c297b921d9",
     "tools/adaptive/models/muse-spark.conf": "9ce42daa0223bcad4f6cda8ed9648a42563bbbd69c6db2633590fef567876341",
     "tools/adaptive/expert_source.py": "77ceef661d23d0c6c66d7cd1688dcb4bea478d1788f616763e81ea78fe401914",
-    "tools/adaptive/gguf_header.py": "2d802d523d4f64dfde445414a0c5a3b3a12b4b4e7226865d37834ae78418b569",
+    "tools/adaptive/gguf_header.py": "2a23afb79129d080c46be2400c9b316b06d8d02298f1b0795d9fd1dbb37e4dab",
     "scripts/run-macos-ssd.py": "4b045fd8cad594fb265fe7fd848c267cd01bde1217e4f7d43d64b7028379f427",
     "scripts/run-macos-ssd.sh": "cd19069b81b638f82973de8175415365b00b722f58bbbf125d805414211461d2",
     "scripts/kimi-build-gguf-expert-alias-tsv.py": "259b519de265aef82c60c4d78899b241a61a1450b50a1fde1cda431a0d4b77ca",

@@ -98,7 +98,7 @@ struct fixture_inputs {
             "cache_elastic", "cache_partial_reclaim", "cache_reclaimable_file", "cache_reserve_bytes",
             "cache_prefill_slots", "cache_layer_quotas", "vram_budget", "vram_async", "vram_exclusive",
             "vram_deferred", "vram_prefill", "vram_locations", "place_costs", "trace", "timeline", "profile",
-            "mrc", "ledger"
+            "mrc", "ledger", "trace_capacity", "trace_prior", "trace_file", "vram_lookahead", "drop_mass"
         };
         if (std::none_of(std::begin(recognized), std::end(recognized), [&](const char * item) { return key == item; })) {
             throw std::runtime_error("unknown explicit fixture field " + key);
@@ -166,7 +166,7 @@ struct fixture_inputs {
         FIXTURE_TIER_BOOL(global); FIXTURE_TIER_BOOL(adaptive_admission); FIXTURE_TIER_BOOL(mxfp4_gpu_hidden);
         FIXTURE_TIER_INT(safety_mib); FIXTURE_TIER_INT(safety_blocks); FIXTURE_TIER_INT(margin_mib);
         FIXTURE_TIER_INT(max_slots); FIXTURE_TIER_INT(fail_malloc_at); FIXTURE_TIER_INT(fail_free_at);
-        FIXTURE_TIER_INT(low_mib); FIXTURE_TIER_INT(high_mib);
+        FIXTURE_TIER_INT(low_mib); FIXTURE_TIER_INT(high_mib); FIXTURE_TIER_INT(warm_mib); FIXTURE_TIER_INT(warm_bits);
 #undef FIXTURE_TIER_BOOL
 #undef FIXTURE_TIER_INT
         out.async_upload = boolean("vram_async", out.async_upload);
@@ -194,9 +194,12 @@ struct fixture_inputs {
         FIXTURE_INT(poll_us); FIXTURE_INT(dynamic_chunk_rows); FIXTURE_INT(decode_participants);
         FIXTURE_INT(prefetch_depth); FIXTURE_INT(prefetch_fail_every); FIXTURE_INT(prefetch_throw_drain);
         FIXTURE_INT(prefetch_throw_schedule); FIXTURE_INT(cache_reserve_bytes); FIXTURE_INT(cache_prefill_slots);
-        FIXTURE_INT(vram_budget);
+        FIXTURE_INT(vram_budget); FIXTURE_INT(vram_lookahead); FIXTURE_INT(drop_mass);
 #undef FIXTURE_BOOL
 #undef FIXTURE_INT
+        out.trace_capacity = size_t(integer("trace_capacity", out.trace_capacity));
+        out.trace_prior = boolean("trace_prior", out.trace_prior);
+        if (const char * value = get("trace_file")) { out.trace_file = value; }
         if (const char * value = get("cache_policy")) { out.cache_policy = value; }
         if (const char * value = get("cache_allocation")) { out.cache_allocation = value; }
         out.io_cpus = cpus("io_cpus");

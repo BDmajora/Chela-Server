@@ -3,17 +3,40 @@
 #include <stdint.h>
 #include "ggml-ssd/gpu/kernels.h"
 #include "ggml-ssd/gpu/kimi-vram-tier-api.h"
-struct vram_compute_expert { const void * up; const void * gate; const void * down; };
+// warm: the roles are the warm pool's low-precision copy, not the expert's own format
+// up_type, down_type: its layer's ggml types; -1, the format the engine was created with
+struct vram_compute_expert { const void * up; const void * gate; const void * down; int warm = 0; int up_type = -1, down_type = -1; };
+// The runtime's event handle, as cudaEvent_t or hipEvent_t names it.
+#if defined(GGML_USE_HIP)
+struct ihipEvent_t;
+typedef struct ihipEvent_t * vram_gpu_event;
+#else
+struct CUevent_st;
+typedef struct CUevent_st * vram_gpu_event;
+#endif
 // Engine of the explicit-format tier path: both GPU matvec stages with the host
 // activation and hidden quantization between them; returns unweighted down rows.
 struct vram_format_compute_api {
-    uint32_t version, size; // 2: explicit immutable CPU kernels in create
+    uint32_t version, size; // 4: explicit immutable CPU kernels in create, the warm entries, add_format
     void * (*create)(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, const ssd::gpu::cpu_kernels_v1 *, char *, size_t);
     void (*destroy)(void *);
     int (*compute)(void *, const vram_compute_expert *, int hits, const void * input, size_t input_bytes,
                    const kimi_vram_activation * activation, float * host_down, char * error, size_t error_size);
     size_t (*device_scratch_bytes)(void *);
     size_t (*host_scratch_bytes)(void *);
+    // The warm pool (vram-warm-pool.h), for an engine that can compute a low-precision copy; all null otherwise.
+    // warm_configure takes the pool's precision, 2 or 4 bits, and the caller's event (it stays the caller's), allocates
+    // the conversion's stream and scratch, and returns the bytes of a copy's three roles, all 0 where the format gains
+    // nothing from that precision (a copy would take more than 3/4 of the native bytes, or the device cannot convert
+    // it). warm_demote queues the conversion of a resident expert into `warm` and returns, with the event recorded
+    // after it: a stream waits for the event before it overwrites the expert's slot, and compute before it reads a warm
+    // copy. warm_drain waits for every conversion.
+    int (*warm_configure)(void *, int bits, vram_gpu_event done, size_t * role_bytes, char * error, size_t error_size);
+    int (*warm_demote)(void *, const vram_compute_expert * native, void * warm, char * error, size_t error_size);
+    int (*warm_drain)(void *, char * error, size_t error_size);
+    // A further format the engine computes, for an expert that names it. Before warm_configure, which covers them all.
+    // Null: the engine serves the format it was created with and no other.
+    int (*add_format)(void *, int weight_type, int down_type, char * error, size_t error_size);
 };
 typedef const vram_format_compute_api * (*vram_format_compute_get_api_fn)();
 // Engine of grouped prefill for any expert format the CUDA backend multiplies (group-compute-adapter.cu). Per layer, the
@@ -25,7 +48,6 @@ typedef const vram_format_compute_api * (*vram_format_compute_get_api_fn)();
 // loads every kernel a pass runs, so no device memory is taken between it and release, which gives the buffers back
 // (before decode grows the tier). The kernels stay loaded for the process: the first reserve of a type and shape takes
 // their device memory for good, and meanwhile a scratch of one matrix and its operands, which it frees.
-struct CUevent_st;
 struct vram_group_activation {
     struct kimi_vram_activation base;
     const float * post_norm;    // latent weights of the per-expert post norm, or null; copied by begin_layer
@@ -53,9 +75,11 @@ struct vram_group_layer_stats {
                                 // whatever the stream waited for between them: the copies they were ready after)
 };
 struct vram_group_compute_api {
-    uint32_t version, size;   // 2
+    uint32_t version, size;   // 3
     void * (*create)(int device, int latent, int hidden, int weight_type, int down_type, char * error, size_t error_size);
     void (*destroy)(void *);
+    // A further format compute may be given, before the first reserve (which loads every format's kernels).
+    int (*add_format)(void *, int weight_type, int down_type, char * error, size_t error_size);
     // Buffers for passes of up to `rows` input rows and `routes` routes a layer (device and page-locked host memory,
     // the products' own reservations). Grows only; release frees all of it. A pass reserves once, before its first
     // layer, for its tokens and tokens x slots routes (no layer has more rows with GPU work); a later reserve that grows
@@ -72,8 +96,8 @@ struct vram_group_compute_api {
     // Queues group g's chain with these weights. The chain waits for `ready` (a weights upload, or null) on the device;
     // *done (optional) receives an event that completes when the chain no longer reads the weights, valid until the
     // next begin_layer.
-    int (*compute)(void *, int group, const struct vram_compute_expert * weights, struct CUevent_st * ready,
-                   struct CUevent_st ** done, char * error, size_t error_size);
+    int (*compute)(void *, int group, const struct vram_compute_expert * weights, vram_gpu_event ready,
+                   vram_gpu_event * done, char * error, size_t error_size);
     // Waits for the layer and returns its accumulated rows [rows][latent] (page-locked, valid until the next
     // begin_layer) and the layer's stats; group_us (optional, one per group) each chain's time. Every group of the
     // layer must have been computed.

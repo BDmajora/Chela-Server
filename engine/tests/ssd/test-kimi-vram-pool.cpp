@@ -1,4 +1,5 @@
 #include "vram-slot-table.h"
+#include "vram-warm-pool.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -225,6 +226,136 @@ int main() { try {
         t.prepare(&fresh,1);
         require(t.admissions[0]<0 && std::fabs(t.mature(1)-1)<0.02,"a mature table admitted a count-1 miss at 2 hits an upload");
         publish(t);
+    }
+    // The request-level prior: counts as if the predicted rates had been selected, in effect at that layer's prepare.
+    {
+        vram_slot_table t(2,{1,2},true,0,true,16,1,2,8);
+        std::vector<float> rates(8,0.0f);rates[3]=2.0f;
+        t.next_token();
+        rejected([&]{t.set_prior(0,rates.data(),8);}); // not a layer of the table
+        rejected([&]{t.set_prior(1,rates.data(),7);}); // another expert count
+        auto hot=request(1,3),cold=request(1,5);
+        t.set_prior(1,rates.data(),8);
+        require(t.primed && t.mature(1)==1,"a primed table still scaled its counts");
+        const double memory=1/(1-std::exp2(-1.0/16));
+        require(std::fabs(t.layers[1].counts[3]-2*memory)<1e-9,"the prior is not the count the rate leaves");
+        kimi_vram_request both[]={cold,hot};
+        t.prepare(both,2);
+        require(std::fabs(t.layers[1].counts[3]-(2*memory*std::exp2(-1.0/16)+1))<1e-9,
+                "the layer's prepare did not decay the prior one token and add the selection");
+        require(t.admissions[0]>=0 && t.admissions[1]>=0,"free slots refused selected experts");
+        publish(t);
+        // in a full table the prior keeps the predicted resident against an unpredicted one's selection
+        t.next_token();const auto newer=request(1,6);
+        t.prepare(&newer,1);
+        require(t.admissions[0]>=0 && t.slots[size_t(t.admissions[0])].key.expert==6,"the admission took no slot");
+        publish(t);
+        require(t.holds(1,3),"a predicted resident was evicted before an unpredicted one");
+        rejected([&]{t.next_token();t.prepare(&newer,1);t.set_prior(1,rates.data(),8);});
+        t.finish();
+        vram_slot_table lru(2,{1,2},false);lru.next_token();lru.set_prior(1,nullptr,0);
+        require(!lru.primed,"a table without counts took a prior");
+    }
+    // The lookahead: an expert of the next layer goes up ahead of its selection on prepare's terms.
+    {
+        vram_slot_table t(2,{1,2},true,1.5,true,16,1,2,8);
+        auto a=request(2,1),b=request(2,2),c=request(2,3);
+        t.next_token();
+        // before the costs are measured the fixed minimum count rules, as in prepare
+        require(t.reserve_lookahead(a,1.0)<0,"a lookahead below the minimum count was admitted");
+        rejected([&]{t.reserve_lookahead(a,1.5);});
+        t.admission_hits=0.5;t.refresh_expected();
+        const int slot=t.reserve_lookahead(a,0.9);
+        require(slot>=0 && t.slots[size_t(slot)].uploading && !t.slots[size_t(slot)].valid,"a free slot refused the lookahead");
+        require(t.holds(2,1) && t.reserve_lookahead(a,0.9)<0,"an expert on its way was admitted again");
+        holds_match(t,"lookahead reservation");
+        t.publish_upload(size_t(slot),a);
+        require(t.layers[2].counts[1]==0,"a lookahead counted a selection decode has not made");
+        t.prepare(&a,1);
+        require(t.hits[0]==slot && t.lookahead_used==1 && !t.slots[size_t(slot)].lookahead,"the next layer's selection was not a hit");
+        publish(t);
+        // a live layer's locked slots are no victims; an idle slot is
+        t.next_token();
+        t.prepare(&a,1);
+        const int second=t.reserve_lookahead(b,0.9);
+        require(second>=0 && second!=slot,"a lookahead took the live layer's slot");
+        t.finish();t.publish_upload(size_t(second),b);
+        // the table is full: an expert of low probability is not worth its victim and its upload, and an unused
+        // lookahead counts when it goes
+        t.next_token();
+        t.prepare(&a,1);publish(t);
+        t.admission_hits=3;t.refresh_expected();
+        require(t.reserve_lookahead(c,0.2)<0,"an unlikely expert took a slot");
+        t.admission_hits=0;t.refresh_expected();
+        const int third=t.reserve_lookahead(c,1.0);
+        require(third==second && t.lookahead_unused==1,"the unused lookahead was not the victim, or not counted");
+        t.cancel_upload(size_t(third),c);
+        holds_match(t,"lookahead cancelled");
+    }
+    // The warm pool: what eviction leaves, most recent first, and nothing a live batch reads.
+    {
+        const auto key=[&](int layer,int expert,uint64_t offset=0){kimi_vram_request r=request(layer,expert);r.role[0].offset+=offset;return r;};
+        rejected([&]{vram_warm_pool none(0);});
+        vram_warm_pool pool(2);
+        const auto a=key(1,1),b=key(1,2),c=key(2,1);
+        require(pool.find(a)<0,"an empty pool found an expert");
+        const int first=pool.reserve(a),second=pool.reserve(b);
+        require(first>=0 && second>=0 && first!=second,"free pool slots were not taken");
+        require(pool.reserve(a)<0,"a held copy was converted again");
+        require(pool.find(a)==first && pool.find(b)==second,"a held copy was not found");
+        require(pool.reserve(c)<0,"a slot this batch reads was taken");
+        pool.release();
+        require(pool.find(a)==first,"a released copy was lost");
+        pool.release();
+        require(pool.reserve(c)==second && pool.replaced==1,"the least recently used copy was not the victim");
+        require(pool.find(b)<0,"a replaced copy stayed");
+        pool.release();
+        const auto moved=key(1,1,4096);
+        require(pool.find(moved)<0,"another payload of the expert read as this one");
+        const int again=pool.reserve(moved);
+        require(again>=0 && pool.find(moved)==again && pool.find(a)<0,"a moved payload did not replace its old copy");
+        pool.release();
+        // the table reports decode's evictions and the lookahead's, not an empty slot's admission or a seed's
+        vram_slot_table t(1,{1,2},true,0,true,16,1,2,4);
+        t.track_evicted=true;t.next_token();
+        const auto d=key(1,3),e=key(2,3);
+        t.prepare(&d,1);
+        require(t.evicted.empty(),"an empty slot reported an eviction");
+        publish(t);
+        t.next_token();
+        t.prepare(&e,1);
+        require(t.evicted.size()==1 && t.evicted[0].slot==0 && vram_slot_table::same(t.evicted[0].key,d),"an eviction went unreported");
+        publish(t);
+        t.evicted.clear();
+        t.next_token();
+        const int ahead=t.reserve_lookahead(d,1.0);
+        require(ahead==0 && t.evicted.size()==1 && vram_slot_table::same(t.evicted[0].key,e),"a lookahead's eviction went unreported");
+        t.cancel_upload(size_t(ahead),d);
+    }
+    {
+        // Slots of two sizes: an expert takes its own size, or a larger slot that is empty or holds its size, and a slot's
+        // own size evicts whatever is there.
+        vram_slot_table t(3,{1,2},true,0,true,16,1,2,8);
+        t.slot_bytes={20000,20000,12288};
+        const auto sized=[](int layer,int expert,uint64_t bytes){auto r=request(layer,expert);r.role[0].bytes=bytes-8192;return r;};
+        const auto small=sized(2,0,12288),small2=sized(2,1,12288),large=sized(1,0,20000),large2=sized(1,1,20000);
+        t.next_token();t.prepare(&small,1);
+        require(t.admissions[0]==0,"an expert did not take an empty larger slot");
+        publish(t);
+        t.next_token();t.prepare(&large,1);
+        require(t.admissions[0]==1,"a large expert did not take the empty slot of its size");
+        publish(t);
+        t.next_token();t.prepare(&small2,1);
+        require(t.admissions[0]==2,"an expert did not take the empty slot of its size");
+        publish(t);
+        t.next_token();t.prepare(&large2,1);
+        require(t.admissions[0]==0,"a slot's own size did not evict the smaller expert in it");
+        publish(t);
+        t.next_token();t.prepare(&small,1);
+        require(t.admissions[0]==2,"an expert evicted a larger one");
+        publish(t);
+        t.resize_global(2);
+        require(t.slot_bytes.size()==2,"a shrink kept the sizes of its slots");
     }
     std::printf("VRAM_GLOBAL_POOL_PASS assertions=%d\n",checks);return 0;
 } catch(const std::exception & e) { std::fprintf(stderr,"VRAM_GLOBAL_POOL_FAIL: %s\n",e.what());return 1; } }

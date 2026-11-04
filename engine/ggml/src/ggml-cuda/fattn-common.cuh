@@ -1068,6 +1068,14 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+#ifdef GGML_USE_HIP
+    // Some distribution builds of ROCm report 256 instead of 1024 VGPRs per SIMD for RDNA1 and RDNA2, so the
+    // query answers 0 for 256-thread kernels with more than 128 VGPRs that do fit. A launch that truly does not
+    // fit still fails at the cudaGetLastError check after it.
+    if (max_blocks_per_sm == 0) {
+        max_blocks_per_sm = 1;
+    }
+#endif // GGML_USE_HIP
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 

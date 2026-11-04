@@ -206,7 +206,7 @@ def test_short_reads_are_completed_or_rejected_without_zero_fill():
 @pytest.mark.parametrize(
     "tensors,message",
     [
-        ([(EXPERT, (32, 2, 256), 42, 0)], "unsupported native ggml type 42"),
+        ([(EXPERT, (32, 2, 256), 36, 0)], "unsupported native ggml type 36"),
         ([("dense", (32,), 999, 0)], "unsupported native ggml type 999"),
         ([("dense", (), 0, 0)], "invalid dimension count"),
         ([("dense", (1, 1, 1, 1, 1), 0, 0)], "invalid dimension count"),
@@ -411,14 +411,15 @@ def test_all_native_tensor_names_are_byte_bounded_before_reading(tmp_path, monke
     assert m.read_header(path).tensors[0].name == "d" * 127
 
 
-def test_legacy_type42_observation_remains_separate_from_native_admission(tmp_path):
+def test_both_readers_size_type42_as_upstream_q2_0(tmp_path):
     from inferssd.source import header
 
     path = tmp_path / "model.gguf"
     fixture(path, tensors=[("dense", (128, 1, 256), 42, 0)])
-    assert header.read(str(path)).tensors[0].type == 42
-    with pytest.raises(ValueError, match="unsupported native ggml type 42"):
-        m.read_header(path)
+    legacy = header.read(str(path)).tensors[0]
+    native = m.read_header(path).tensors[0]
+    assert legacy.type_name == "Q2_0"
+    assert legacy.nbytes == native.nbytes == 128 * 256 // 64 * 18
 
 
 def test_path_controls_missing_empty_and_alignment(tmp_path):

@@ -22,6 +22,8 @@ struct tier_options {
     size_t low_mib = 128, high_mib = 448;
     bool global = false, count_policy = true, adaptive_admission = true;
     double min_count = 0, half_life = 2;
+    size_t warm_mib = 0;
+    int warm_bits = 4;
 };
 struct api {
     uint32_t version;

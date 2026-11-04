@@ -403,7 +403,8 @@ size_t host_bytes(void * p) {
 }
 
 extern "C" const vram_format_compute_api * kimi_vram_format_compute_get_api() {
-    static const vram_format_compute_api api{2, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes};
+    static const vram_format_compute_api api{4, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes,
+        nullptr, nullptr, nullptr, nullptr};
     return &api;
 }
 

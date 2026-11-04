@@ -20,6 +20,8 @@ public:
         uint32_t hits_since_admit = 0;
         // uploading: reserved by a deferred upload that outlives its layer; never a victim until published
         bool valid = false, locked = false, uploading = false;
+        // lookahead: admitted ahead of its selection (reserve_lookahead), until a decode selects it or it is evicted
+        bool lookahead = false;
         // seed: put into an empty slot by a prefill (reserve_cold_prefill), not admitted by decode. Its selection
         // count is zero until decode requests it, and it stays out of the earned statistics, which price decode's
         // own admissions. The first decode request makes it an ordinary entry, admitted at that request's count.
@@ -34,6 +36,10 @@ public:
         mutable double score_factor = 1;
     };
     std::vector<entry> slots;
+    // What each slot holds where slots differ in size (layers of different formats); empty: any slot holds any expert. An
+    // expert takes a slot of its size, or a larger one that is empty or holds an expert of its size; a slot's own size
+    // evicts whatever is there, so that an expert in a larger slot gives way when that size needs it.
+    std::vector<size_t> slot_bytes;
     std::vector<layer> layers;
     std::vector<int> pool_layers;
     std::vector<int> hits, admissions;
@@ -82,8 +88,32 @@ public:
     // old. The fixed minimum_count, the rule before the costs are measured, and a candidate's comparison with its
     // victim keep the counts as they are.
     double mature(double count) const {
-        if (!count_decay || !origin || step < origin) return count;
+        if (!count_decay || primed || !origin || step < origin) return count;
         return count / (1 - std::exp2(-double(step - origin + 1) / half_life));
+    }
+    // A request's predicted selections per decode token (ssd::place::expert_predictor) as the counts they would have
+    // left: an expert selected at rate r every token has the decayed count r / (1 - 2^(-1/half_life)). The prior
+    // replaces the layer's counts, the previous request's heat, which the prediction already weighs (its last source),
+    // and decays from here like any count, so the request's own selections take over within a few half-lives. The
+    // counts are then over the memory already (primed): mature() leaves them. Only between layers, with no lease.
+    bool primed = false;
+    uint64_t priors = 0, lookaheads = 0, lookahead_used = 0, lookahead_unused = 0;
+    void set_prior(int id, const float * rates, size_t n) {
+        if(!count_decay)return;
+        if(in_flight || lease_generation || !rates)throw std::runtime_error("invalid VRAM prior phase");
+        if(id<first_layer || size_t(id)>=layers.size() || n!=size_t(experts))throw std::runtime_error("VRAM prior layer or expert count");
+        auto & l=layers[id];
+        const double memory=1.0/(1.0-std::exp2(-1.0/half_life));
+        for(size_t e=0;e<n;++e){
+            const double r=rates[e];
+            if(!std::isfinite(r) || r<0)throw std::runtime_error("VRAM prior rate");
+            l.counts[e]=r*memory;
+        }
+        // the history up to the token before this one: the layer's prepare at this token decays it by one token and
+        // adds this token's selections, as for any count
+        if(!origin)origin=step?step:1;
+        l.observed=step?step-1:0;l.score_step=step;l.score_factor=std::exp2(-double(step-l.observed)/half_life);
+        primed=true;++priors;
     }
     // Smallest count, over the table's memory, an admission into a free slot needs (diagnostics).
     double admission_count() const {
@@ -91,6 +121,10 @@ public:
         return earned_steps / 4.0;
     }
     uint64_t lease_generation = 0, next_generation = 0;
+    // Decode's evictions, while track_evicted, for the tier's warm pool to take before anything overwrites their slots.
+    struct evicted_entry { int slot; kimi_vram_request key; };
+    bool track_evicted = false;
+    std::vector<evicted_entry> evicted;
 
     explicit vram_slot_table(size_t capacity, const std::vector<int> & priority, bool decay, double minimum=0,
             bool global=false, double half=2, int first=1, int last=92, int experts_per_layer=896) :
@@ -137,6 +171,7 @@ public:
         }
         for (size_t i = capacity; i < slots.size(); ++i) change(slots[i], [](entry & x) { x = {}; });
         slots.resize(capacity);
+        if (slot_bytes.size() > capacity) { slot_bytes.resize(capacity); }
         for (int id : pool_layers) {
             layers[id].begin = 0;
             layers[id].count = capacity;
@@ -151,6 +186,11 @@ public:
         if(a.layer!=b.layer || a.expert!=b.expert)return false;
         for(int r=0;r<3;++r)if(!same_source(a.role[r],b.role[r]))return false;
         return true; // Routing weight is not part of immutable payload identity.
+    }
+    static size_t expert_bytes(const kimi_vram_request & r) { return r.role[0].bytes + r.role[1].bytes + r.role[2].bytes; }
+    bool fits(size_t i, size_t bytes) const {
+        if (slot_bytes.empty() || slot_bytes[i] == bytes) { return true; }
+        return slot_bytes[i] > bytes && (!slots[i].valid || expert_bytes(slots[i].key) == bytes);
     }
     bool native_pinned() const {
         return std::any_of(slots.begin(),slots.end(),[](const entry & e){return e.native_refs!=0;});
@@ -180,7 +220,7 @@ public:
         if(in_flight || lease_generation || native_pinned()) { throw std::runtime_error("clear with live VRAM slots"); }
         for(auto & e:slots)e={};
         for(auto & l:layers){std::fill(l.counts.begin(),l.counts.end(),0.0);std::fill(l.held.begin(),l.held.end(),0);l.observed=l.score_step=0;l.score_factor=1;}
-        hits.clear();admissions.clear();requests.clear();step=clock=origin=0;
+        hits.clear();admissions.clear();requests.clear();evicted.clear();step=clock=origin=0;primed=false;
     }
     void next_token() { if(in_flight || lease_generation || native_pinned())throw std::runtime_error("token with live VRAM slots");++step; }
     double score(const entry & e) const {
@@ -224,6 +264,7 @@ public:
                 e.locked=true;e.touched=++clock;hits[j]=int(i);
                 if(e.seed){e.seed=false;e.admit_count=count_decay?mature(l.counts[requests[j].expert]):1;e.hits_since_admit=0;}
                 else ++e.hits_since_admit;
+                if(e.lookahead){e.lookahead=false;++lookahead_used;}
                 break;
             }
         }
@@ -237,8 +278,9 @@ public:
             if(count_decay && admission_hits<0 && count<minimum_count)continue;
             if(std::any_of(slots.begin()+l.begin,slots.begin()+l.begin+l.count,[&](const entry & e){return (e.locked || e.native_refs || e.uploading) && same(e.key,requests[j]);}))continue;
             int victim=-1;
+            const size_t bytes=expert_bytes(requests[j]);
             for(size_t i=l.begin;i<l.begin+l.count;++i) {
-                const auto & e=slots[i];if(e.locked || e.native_refs || e.uploading)continue;
+                const auto & e=slots[i];if(e.locked || e.native_refs || e.uploading || !fits(i,bytes))continue;
                 if(!e.valid){victim=int(i);break;}
                 if(victim<0 || score(e)<score(slots[victim]) ||
                    (score(e)==score(slots[victim]) && e.touched<slots[victim].touched))victim=int(i);
@@ -247,15 +289,55 @@ public:
             auto & e=slots[victim];
             if(e.valid && count_decay && count<score(e))continue;
             if(count_decay && admission_hits>=0 && expected_hits(mature(count))-(e.valid?expected_hits(mature(score(e))):0)<admission_hits)continue;
-            if(e.valid && !e.seed){
-                for(int s=0;s<earned_steps;++s){earned_hits[s]*=0.999;earned_weight[s]*=0.999;}
-                const int s=earned_step(e.admit_count);earned_hits[s]+=e.hits_since_admit;earned_weight[s]+=1;++earned_samples;
-            }
-            change(e,[&](entry & x){evictions+=x.valid;x.valid=false;x.seed=false;x.locked=true;x.key=requests[j];x.touched=++clock;});
+            if(e.valid && !e.seed)record_earned(e);
+            if(track_evicted && e.valid && !e.seed)evicted.push_back({victim,e.key});
+            lookahead_unused+=e.lookahead;
+            change(e,[&](entry & x){evictions+=x.valid;x.valid=false;x.seed=false;x.lookahead=false;x.locked=true;x.key=requests[j];x.touched=++clock;});
             admissions[j]=victim;
             e.admit_count=count_decay?mature(count):1;e.hits_since_admit=0;
         }
         in_flight=true;
+    }
+    // What an evicted entry earned, for the admissions after it.
+    void record_earned(const entry & e) {
+        for(int s=0;s<earned_steps;++s){earned_hits[s]*=0.999;earned_weight[s]*=0.999;}
+        const int s=earned_step(e.admit_count);earned_hits[s]+=e.hits_since_admit;earned_weight[s]+=1;++earned_samples;
+    }
+    // An expert of a later layer that the router lookahead predicts, admitted ahead of its selection on prepare's terms:
+    // its count with that selection, its expected hits weighed by the probability that the selection comes, against
+    // the victim's and the upload's price; before the costs are measured (admission_hits below 0), the fixed minimum
+    // count. The selection itself is not counted: prepare counts what decode selects. Returns the slot, reserved for a
+    // deferred upload (publish_upload or cancel_upload), or -1 (held, no victim, not worth it). Any phase but a lease: a
+    // live layer's slots are locked, and nothing locked is a victim.
+    int reserve_lookahead(const kimi_vram_request & request, double probability) {
+        if(lease_generation || request.layer<first_layer || size_t(request.layer)>=layers.size() ||
+                request.expert<0 || request.expert>=experts || !(probability>=0 && probability<=1)) {
+            throw std::runtime_error("invalid VRAM lookahead reservation");
+        }
+        if(!count_decay)return -1;
+        const auto & l=layers[request.layer];
+        if(l.held[size_t(request.expert)])return -1;
+        const double count=l.counts[size_t(request.expert)]*std::exp2(-double(step-l.observed)/half_life)+1;
+        int victim=-1;
+        const size_t bytes=expert_bytes(request);
+        for(size_t i=l.begin;i<l.begin+l.count;++i) {
+            const auto & e=slots[i];if(e.locked || e.native_refs || e.uploading || !fits(i,bytes))continue;
+            if(!e.valid){victim=int(i);break;}
+            if(victim<0 || score(e)<score(slots[victim]) ||
+               (score(e)==score(slots[victim]) && e.touched<slots[victim].touched))victim=int(i);
+        }
+        if(victim<0)return -1;
+        auto & e=slots[victim];
+        if(e.valid && count<score(e))return -1;
+        if(admission_hits<0 ? count<minimum_count :
+                probability*expected_hits(mature(count))-(e.valid?expected_hits(mature(score(e))):0)<admission_hits)return -1;
+        if(e.valid && !e.seed)record_earned(e);
+        if(track_evicted && e.valid && !e.seed)evicted.push_back({victim,e.key});
+        lookahead_unused+=e.lookahead;
+        change(e,[&](entry & x){evictions+=x.valid;x.valid=false;x.seed=false;x.lookahead=true;x.uploading=true;x.key=request;x.touched=++clock;});
+        e.admit_count=mature(count);e.hits_since_admit=0;
+        ++lookaheads;
+        return victim;
     }
     void publish(size_t request_index) {
         if(!in_flight || request_index>=admissions.size() || admissions[request_index]<0)throw std::runtime_error("VRAM publication without reservation");
@@ -290,9 +372,10 @@ public:
             const auto & e=slots[i];
             if((e.valid || e.uploading) && same(e.key,request))return -1;
         }
+        const size_t bytes=expert_bytes(request);
         for(size_t i=l.begin;i<l.begin+l.count;++i) {
             auto & e=slots[i];
-            if(e.valid || e.locked || e.native_refs || e.uploading)continue;
+            if(e.valid || e.locked || e.native_refs || e.uploading || !fits(i,bytes))continue;
             change(e,[&](entry & x){x.key=request;x.touched=++clock;x.uploading=true;x.seed=true;x.admit_count=0;x.hits_since_admit=0;});
             return int(i);
         }

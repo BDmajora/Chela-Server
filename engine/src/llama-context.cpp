@@ -318,6 +318,12 @@ llama_context::llama_context(
                 cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
                     kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
                     int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
+                for (const int32_t il : routed_layers) {
+                    const auto & layer = model.layers[il];
+                    const ggml_tensor * up = layer.ffn_up_exps, * gate = layer.ffn_gate_exps, * down = layer.ffn_down_exps;
+                    cpu_sink_runtime->expert_formats.push_back({ il, int32_t(up->type), int32_t(down->type),
+                        { uint64_t(up->nb[2]), uint64_t(gate->nb[2]), uint64_t(down->nb[2]) } });
+                }
                 if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
                     for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
                         const auto & layer = model.layers[il];

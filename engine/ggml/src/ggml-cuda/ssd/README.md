@@ -8,7 +8,11 @@ the original kernel bodies. No component DSO or preload is used.
 
 The owner supplies tensor types, geometry, expert count and layer IDs through
 `kimi_vram_format_api`; it supplies source file identities and ranges through
-`kimi_vram_request`. The tier shares admission policy, asynchronous and deferred
+`kimi_vram_request`. Layers share their geometry and may differ in their types:
+`layer_formats` names every layer's types and role bytes before the first
+prepare, an elastic tier's blocks come in the experts' sizes in proportion to
+their layers (a fixed arena's slots hold the largest), and each expert carries
+its layer's types into the engines. MXFP4's engines serve their format alone. The tier shares admission policy, asynchronous and deferred
 uploads, residency leases, elastic blocks and failure cleanup across formats.
 A borrowed upload keeps its source pinned until collect/finish or failure drain.
 Reclaim refuses live compute/residency leases and drains queued copies before
@@ -26,6 +30,14 @@ transport ABI remains version 2 with its existing field order; implicit
 `prepare`/`launch` slots return an explicit unsupported-format error and drain
 their context. Use the explicit format extension. Generic upstream Q3_K
 quantizers and kernels remain part of ggml.
+
+The same sources build for AMD GPUs through ggml's CUDA-to-HIP names
+(`../vendors/hip.h`, `gpu-runtime.h`) and link into `ggml-hip`; every source there
+is HIP language, and the strict parity target carries the equivalent flags. Device
+work reads from the slot table's decisions: `vram-slot-table.h` holds the decayed
+counts, the admission price, the request prior and the lookahead reservations, and
+`vram-warm-pool.h` the optional low-precision copies, which the generic engine alone
+computes and `expert-requantize.cu` makes.
 
 GPU lifecycle and numerical tests require an owned device and the matching
 normal backend. They are built as explicit targets and are not automatically
