@@ -2587,6 +2587,51 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+static bool llama_graph_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
+
+static ggml_tensor * llama_graph_turbo_rotate_q(ggml_context * ctx, ggml_tensor * q, const ggml_tensor * k) {
+    if (!llama_graph_type_is_turbo(k->type)) {
+        return q;
+    }
+    if (q->type != GGML_TYPE_F32) {
+        q = ggml_cast(ctx, q, GGML_TYPE_F32);
+    }
+    const int64_t padded = (q->ne[0] + 127) / 128 * 128;
+    if (padded != q->ne[0]) {
+        q = ggml_pad(ctx, q, padded - q->ne[0], 0, 0, 0);
+    }
+    if (!ggml_is_contiguous(q)) {
+        q = ggml_cont(ctx, q);
+    }
+    return ggml_turbo_wht(ctx, q, 0, 0, nullptr);
+}
+
+static ggml_tensor * llama_graph_turbo_unpad_v(
+        ggml_context * ctx,
+        ggml_tensor * out,
+        const ggml_tensor * v,
+        const llama_hparams & hparams,
+        int il) {
+    if (!llama_graph_type_is_turbo(v->type)) {
+        return out;
+    }
+    const int64_t padded_head = v->ne[0];
+    const int64_t original_head = hparams.n_embd_head_v(il);
+    if (padded_head == original_head) {
+        return out;
+    }
+    const int64_t n_head = hparams.n_head(il);
+    const int64_t n_tokens = out->ne[1];
+    GGML_ASSERT(out->ne[0] == padded_head * n_head);
+    out = ggml_reshape_3d(ctx, out, padded_head, n_head, n_tokens);
+    out = ggml_view_3d(ctx, out, original_head, n_head, n_tokens,
+            out->nb[1], out->nb[2], 0);
+    out = ggml_cont(ctx, out);
+    return ggml_reshape_2d(ctx, out, original_head * n_head, n_tokens);
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2653,6 +2698,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
+        if (llama_graph_type_is_turbo(v->type)) {
+            if (cur->type != GGML_TYPE_F32) {
+                cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+            }
+            if (!ggml_is_contiguous(cur)) {
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_turbo_wht(ctx0, cur, 1, 128, nullptr);
+        }
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -2718,6 +2773,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
+
+        if (llama_graph_type_is_turbo(v->type)) {
+            if (kqv->type != GGML_TYPE_F32) {
+                kqv = ggml_cast(ctx0, kqv, GGML_TYPE_F32);
+            }
+            if (!ggml_is_contiguous(kqv)) {
+                kqv = ggml_cont(ctx0, kqv);
+            }
+            kqv = ggml_turbo_wht(ctx0, kqv, 1, 128, nullptr);
+        }
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
@@ -2797,7 +2862,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
+    q = llama_graph_turbo_rotate_q(ctx0, q, k);
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    cur = llama_graph_turbo_unpad_v(ctx0, cur, v, hparams, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2896,7 +2963,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    q = llama_graph_turbo_rotate_q(ctx0, q, k);
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    cur = llama_graph_turbo_unpad_v(ctx0, cur, v, hparams, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -2987,7 +3056,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
+    q = llama_graph_turbo_rotate_q(ctx0, q, k);
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    cur = llama_graph_turbo_unpad_v(ctx0, cur, v, hparams, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3075,7 +3146,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    q = llama_graph_turbo_rotate_q(ctx0, q, k);
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    cur = llama_graph_turbo_unpad_v(ctx0, cur, v, hparams, il);
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -3135,7 +3208,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
+    q = llama_graph_turbo_rotate_q(ctx0, q, k);
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    cur = llama_graph_turbo_unpad_v(ctx0, cur, v, hparams, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
