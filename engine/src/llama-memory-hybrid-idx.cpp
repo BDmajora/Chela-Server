@@ -60,10 +60,26 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
+        // The indexer reads half rows of its cache (raw key | pooled key) back through get_rows, and
+        // TurboQuant blocks are rotated across 128 padded values, so they cannot be split or gathered.
+        // The attention cache keeps the TurboQuant type; this small single-head cache uses a plain one.
+        const auto idx_type = [&](ggml_type type) {
+            if (type != GGML_TYPE_TURBO2_0 && type != GGML_TYPE_TURBO3_0 && type != GGML_TYPE_TURBO4_0) {
+                return type;
+            }
+            const ggml_type plain = model.hparams.indexer_head_size % ggml_blck_size(GGML_TYPE_Q8_0) == 0
+                ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+            LLAMA_LOG_INFO("%s: indexer KV cache uses %s instead of %s\n", __func__,
+                    ggml_type_name(plain), ggml_type_name(type));
+            return plain;
+        };
+        const ggml_type type_k_idx = idx_type(type_k);
+        const ggml_type type_v_idx = idx_type(type_v);
+
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             filter_idx, nullptr, "idx_");
     }()) {}

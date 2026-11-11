@@ -2591,7 +2591,7 @@ static bool llama_graph_type_is_turbo(ggml_type type) {
     return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
 }
 
-static ggml_tensor * llama_graph_turbo_rotate_q(ggml_context * ctx, ggml_tensor * q, const ggml_tensor * k) {
+ggml_tensor * llama_graph_turbo_rotate_q(ggml_context * ctx, ggml_tensor * q, const ggml_tensor * k) {
     if (!llama_graph_type_is_turbo(k->type)) {
         return q;
     }
@@ -2608,7 +2608,7 @@ static ggml_tensor * llama_graph_turbo_rotate_q(ggml_context * ctx, ggml_tensor 
     return ggml_turbo_wht(ctx, q, 0, 0, nullptr);
 }
 
-static ggml_tensor * llama_graph_turbo_unpad_v(
+ggml_tensor * llama_graph_turbo_unpad_v(
         ggml_context * ctx,
         ggml_tensor * out,
         const ggml_tensor * v,

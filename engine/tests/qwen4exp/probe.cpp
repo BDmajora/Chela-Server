@@ -71,6 +71,12 @@ int main(int argc,char **argv){try{
     }
     cp.flash_attn_type=std::atoi(argv[5])?LLAMA_FLASH_ATTN_TYPE_ENABLED:LLAMA_FLASH_ATTN_TYPE_DISABLED;
     if (const char * u=std::getenv("QWEN_UNIFIED")) cp.kv_unified=std::atoi(u)!=0;
+    // QWEN_CACHE_TYPE=turbo3 (or any ggml type name) selects the K and V cache type
+    if (const char * name=std::getenv("QWEN_CACHE_TYPE")) {
+        bool found=false;
+        for (int i=0;i<GGML_TYPE_COUNT && !found;++i) if (ggml_type_name((ggml_type)i) && !std::strcmp(ggml_type_name((ggml_type)i),name)) { cp.type_k=cp.type_v=(ggml_type)i;found=true; }
+        require(found,"unknown QWEN_CACHE_TYPE");
+    }
 #ifdef QWEN_INTERNAL
     require(m->hparams.expert_weights_scale==1.0f,"Qwen routed scale is not one");
     for (uint32_t il=0;il<m->hparams.n_layer;++il) {

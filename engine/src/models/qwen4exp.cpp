@@ -543,7 +543,10 @@ ggml_tensor * llm_build_qwen4exp::build_attn_qsa(
     sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
     cb(sel, "kq_mask_qsa", il);
 
+    // a TurboQuant cache holds rotated, padded keys: the query has to match them
+    q = llama_graph_turbo_rotate_q(ctx0, q, k);
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
+    cur = llama_graph_turbo_unpad_v(ctx0, cur, v, hparams, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

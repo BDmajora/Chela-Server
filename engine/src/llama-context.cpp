@@ -4094,7 +4094,18 @@ llama_context * llama_init_from_model(
         return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
     };
     const bool has_turbo_cache = is_turbo_cache(params.type_k) || is_turbo_cache(params.type_v);
-    if (has_turbo_cache) {
+    if (has_turbo_cache && model->arch == LLM_ARCH_DEEPSEEK41) {
+        // Its attention concatenates the raw and compressed key caches and reuses keys as values, which
+        // the rotated, padded TurboQuant blocks cannot follow. Load with the nearest plain type instead
+        // of failing while the graph is built.
+        LLAMA_LOG_WARN("%s: TurboQuant KV cache is not available for this architecture; using q4_0\n", __func__);
+        if (is_turbo_cache(params.type_k)) {
+            params.type_k = GGML_TYPE_Q4_0;
+        }
+        if (is_turbo_cache(params.type_v)) {
+            params.type_v = GGML_TYPE_Q4_0;
+        }
+    } else if (has_turbo_cache) {
         if (model->arch == LLM_ARCH_GROK) {
             LLAMA_LOG_ERROR("%s: TurboQuant KV cache is not supported for Grok\n", __func__);
             return nullptr;

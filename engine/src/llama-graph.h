@@ -820,6 +820,14 @@ struct llm_graph_qkv {
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
 
+// TurboQuant KV cache: the cache stores keys and values padded to a multiple of 128 per head and
+// rotated (Walsh-Hadamard) as they are written. Every attention path that reads such a cache has to
+// rotate and pad its queries the same way before build_attn_mha, and cut the padding off the result.
+// Both are no-ops for any other cache type.
+ggml_tensor * llama_graph_turbo_rotate_q(ggml_context * ctx, ggml_tensor * q, const ggml_tensor * k);
+ggml_tensor * llama_graph_turbo_unpad_v(ggml_context * ctx, ggml_tensor * out, const ggml_tensor * v,
+        const llama_hparams & hparams, int il);
+
 struct llm_graph_context {
     const llm_arch arch;
 

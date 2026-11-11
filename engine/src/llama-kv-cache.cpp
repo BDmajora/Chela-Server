@@ -2191,10 +2191,10 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     if (!v_trans) {
         for (const auto & layer : layers) {
             auto * v = layer.v_stream[cr.strm];
-            const uint32_t n_embd_v_gqa = (uint32_t) v->ne[0];
             if (!v) {
-                continue;
+                continue; // a K-only cache (MLA, indexer) keeps no V tensors
             }
+            const uint32_t n_embd_v_gqa = (uint32_t) v->ne[0];
 
             // Write value type
             const int32_t v_type_i = (int32_t) v->type;
@@ -2217,10 +2217,10 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
         for (const auto & layer : layers) {
             auto * v = layer.v_stream[cr.strm];
-            const uint32_t n_embd_v_gqa = (uint32_t) v->ne[0];
             if (!v) {
-                continue;
+                continue; // a K-only cache (MLA, indexer) keeps no V tensors
             }
+            const uint32_t n_embd_v_gqa = (uint32_t) v->ne[0];
 
             // Write value type
             const int32_t v_type_i = (int32_t) v->type;
@@ -2476,10 +2476,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
             auto * v = layer.v_stream[strm];
-            const uint32_t n_embd_v_gqa = (uint32_t) v->ne[0];
             if (!v) {
-                continue;
+                continue; // a K-only cache (MLA, indexer) keeps no V tensors
             }
+            const uint32_t n_embd_v_gqa = (uint32_t) v->ne[0];
 
             // Read type of value
             int32_t v_type_i_ref;
@@ -2518,10 +2518,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
             auto * v = layer.v_stream[strm];
-            const uint32_t n_embd_v_gqa = (uint32_t) v->ne[0];
             if (!v) {
-                continue;
+                continue; // a K-only cache (MLA, indexer) keeps no V tensors
             }
+            const uint32_t n_embd_v_gqa = (uint32_t) v->ne[0];
 
             // Read type of value
             int32_t v_type_i_ref;
