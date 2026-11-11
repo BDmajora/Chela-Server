@@ -9,7 +9,6 @@
 
 #include "build-info.h"
 #include "common.h"
-#include "ggml-cpu.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
